@@ -1,0 +1,555 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0" />
+  <meta name="theme-color" content="#2D6A4F" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="居家醫療" />
+  <title>居家醫療管理系統</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Serif+TC:wght@400;600;700&display=swap" rel="stylesheet" />
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { height: 100%; background: #F5F2EC; font-family: 'Noto Serif TC', 'Georgia', serif; }
+    #root { min-height: 100vh; }
+    input, select, textarea, button { font-family: inherit; }
+    @keyframes slideUp {
+      from { transform: translateX(-50%) translateY(20px); opacity: 0; }
+      to   { transform: translateX(-50%) translateY(0);    opacity: 1; }
+    }
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(8px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+    input:focus, select:focus, textarea:focus { outline: 2px solid #52B788 !important; outline-offset: 1px; }
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: #f0ede6; }
+    ::-webkit-scrollbar-thumb { background: #b5c4b1; border-radius: 3px; }
+  </style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel">
+const { useState, useEffect, useCallback, useRef } = React;
+
+// ── 色彩主題 ───────────────────────────────────────────────
+const T = {
+  bg: "#F5F2EC", card: "#FFFFFF",
+  primary: "#2D6A4F", primaryLight: "#52B788", primaryDark: "#1B4332",
+  accent: "#D4A017", danger: "#C0392B", warning: "#E67E22",
+  text: "#1A1A2E", textMuted: "#6B7280", border: "#E8E0D0",
+  yellow: "#FFF8E1", yellowBorder: "#FFB300",
+};
+
+// ── 工具函式 ───────────────────────────────────────────────
+const addDays = (ds, n) => {
+  if (!ds) return "";
+  const d = new Date(ds); d.setDate(d.getDate() + n);
+  return d.toISOString().split("T")[0];
+};
+const daysUntil = ds => {
+  if (!ds) return null;
+  const t = new Date(); t.setHours(0,0,0,0);
+  return Math.ceil((new Date(ds) - t) / 86400000);
+};
+const fmt = ds => {
+  if (!ds) return "—";
+  const [y,m,d] = ds.split("-");
+  return `${y}/${m}/${d}`;
+};
+const genId = () => "P" + Date.now().toString().slice(-8) + Math.random().toString(36).slice(2,5);
+const LOCAL_KEY = "home_visit_v2";
+const loadLocal  = () => { try { return JSON.parse(localStorage.getItem(LOCAL_KEY) || "[]"); } catch { return []; } };
+const saveLocal  = d => localStorage.setItem(LOCAL_KEY, JSON.stringify(d));
+const GAS_KEY    = "gas_url_v2";
+
+const TEAMS = ["A 團隊", "B 團隊", "C 團隊", "跨團隊"];
+
+// ────────────────────────────────────────────────────────────
+// APP ROOT
+// ────────────────────────────────────────────────────────────
+function App() {
+  const [patients, setPatients] = useState([]);
+  const [view, setView]         = useState("list"); // list | form | detail
+  const [editing, setEditing]   = useState(null);
+  const [search, setSearch]     = useState("");
+  const [sortBy, setSortBy]     = useState("chartNo");
+  const [onlyAlert, setOnlyAlert] = useState(false);
+  const [toast, setToast]       = useState(null);
+  const [busy, setBusy]         = useState(false);
+  const [delTarget, setDelTarget] = useState(null);
+  const [gasUrl, setGasUrl]     = useState(() => localStorage.getItem(GAS_KEY) || "");
+  const [showSettings, setShowSettings] = useState(false);
+  const [gasDraft, setGasDraft] = useState(() => localStorage.getItem(GAS_KEY) || "");
+
+  useEffect(() => { setPatients(loadLocal()); }, []);
+
+  useEffect(() => {
+    if (!toast) return;
+    const t = setTimeout(() => setToast(null), 3200);
+    return () => clearTimeout(t);
+  }, [toast]);
+
+  const pushToast = (msg, type = "ok") => setToast({ msg, type });
+
+  const syncGAS = useCallback(async (action, payload) => {
+    const url = localStorage.getItem(GAS_KEY);
+    if (!url) return;
+    try {
+      await fetch(url, {
+        method: "POST", mode: "no-cors",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action, ...payload }),
+      });
+    } catch (err) { console.warn("GAS sync error", err); }
+  }, []);
+
+  const persist = (list) => { setPatients(list); saveLocal(list); };
+
+  const savePatient = (data) => {
+    setBusy(true);
+    const isNew = !data.id;
+    const rec = { ...data, id: data.id || genId(), closeDate: data.closeDate || addDays(data.admitDate, 365) };
+    const next = isNew ? [...patients, rec] : patients.map(p => p.id === rec.id ? rec : p);
+    persist(next);
+    syncGAS(isNew ? "create" : "update", { patient: rec });
+    pushToast(isNew ? `✅ 已新增：${rec.name}` : `✅ 已更新：${rec.name}`);
+    setView("list"); setEditing(null); setBusy(false);
+  };
+
+  const deletePatient = (id) => {
+    const p = patients.find(x => x.id === id);
+    persist(patients.filter(x => x.id !== id));
+    syncGAS("delete", { patientId: id });
+    pushToast(`🗑️ 已刪除：${p?.name}`, "danger");
+    setDelTarget(null); setView("list"); setEditing(null);
+  };
+
+  const alertCount = patients.filter(p => { const d = daysUntil(p.closeDate); return d !== null && d >= 0 && d <= 30; }).length;
+
+  const filtered = patients
+    .filter(p => {
+      const q = search.toLowerCase();
+      const hit = !search || [p.name, p.chartNo, p.phone, p.address].some(v => (v||"").toLowerCase().includes(q));
+      if (onlyAlert) { const d = daysUntil(p.closeDate); return hit && d !== null && d <= 30; }
+      return hit;
+    })
+    .sort((a, b) => {
+      // 通用：空白值永遠排最後
+      const cmp = (va, vb) => {
+        if (!va && !vb) return 0;
+        if (!va) return 1;
+        if (!vb) return -1;
+        return va.localeCompare(vb, "zh-TW", { numeric: true });
+      };
+      if (sortBy === "name")      return cmp(a.name, b.name);
+      if (sortBy === "admitDate") return cmp(a.admitDate, b.admitDate);
+      if (sortBy === "closeDate") return cmp(a.closeDate, b.closeDate);
+      // 預設：病歷號排序，空白的改用收案日遞補，再用姓名遞補
+      if (sortBy === "chartNo") {
+        const hasA = !!a.chartNo, hasB = !!b.chartNo;
+        if (hasA && hasB)   return cmp(a.chartNo, b.chartNo);
+        if (!hasA && !hasB) return cmp(a.admitDate, b.admitDate) || cmp(a.name, b.name);
+        return hasA ? -1 : 1; // 有病歷號的排前面
+      }
+      return 0;
+    });
+
+  return (
+    <div style={{ minHeight:"100vh", background:T.bg }}>
+
+      {/* ── Header ── */}
+      <header style={{
+        background: `linear-gradient(135deg, ${T.primaryDark} 0%, ${T.primary} 100%)`,
+        color:"#fff", padding:"14px 16px",
+        display:"flex", alignItems:"center", justifyContent:"space-between",
+        boxShadow:"0 3px 16px rgba(0,0,0,0.2)",
+        position:"sticky", top:0, zIndex:100,
+      }}>
+        <div style={{ display:"flex", alignItems:"center", gap:10 }}>
+          <div style={{ background:"rgba(255,255,255,0.15)", borderRadius:10, width:38, height:38, display:"flex", alignItems:"center", justifyContent:"center", fontSize:20 }}>🏥</div>
+          <div>
+            <div style={{ fontSize:15, fontWeight:700, letterSpacing:.5 }}>居家醫療管理系統</div>
+            <div style={{ fontSize:10, opacity:.7, marginTop:1 }}>中醫居家訪視個案管理</div>
+          </div>
+        </div>
+        <div style={{ display:"flex", gap:8, alignItems:"center" }}>
+          {alertCount > 0 && (
+            <button onClick={() => { setOnlyAlert(v => !v); setView("list"); }} style={{
+              background: onlyAlert ? T.warning : "rgba(255,255,255,0.15)",
+              border: `1.5px solid ${onlyAlert ? T.warning : "rgba(255,255,255,0.3)"}`,
+              color:"#fff", borderRadius:20, padding:"5px 12px",
+              fontSize:12, fontWeight:700, cursor:"pointer",
+            }}>⚠️ 即將結案 {alertCount}</button>
+          )}
+          <button onClick={() => { setGasDraft(gasUrl); setShowSettings(v => !v); }} style={{
+            background:"rgba(255,255,255,0.15)", border:"1px solid rgba(255,255,255,0.25)",
+            borderRadius:8, padding:"7px 10px", color:"#fff", cursor:"pointer", fontSize:14,
+          }}>⚙️</button>
+        </div>
+      </header>
+
+      {/* ── Settings Panel ── */}
+      {showSettings && (
+        <div style={{ background:T.primaryDark, color:"#fff", padding:"14px 16px", borderBottom:`2px solid ${T.primaryLight}` }}>
+          <div style={{ fontSize:12, opacity:.75, marginBottom:6 }}>Google Apps Script 網址（用於同步 Google Drive）</div>
+          <div style={{ display:"flex", gap:8 }}>
+            <input value={gasDraft} onChange={e => setGasDraft(e.target.value)}
+              placeholder="https://script.google.com/macros/s/.../exec"
+              style={{ flex:1, padding:"8px 12px", borderRadius:7, border:"1px solid rgba(255,255,255,0.2)", background:"rgba(255,255,255,0.1)", color:"#fff", fontSize:13 }} />
+            <button onClick={() => {
+              localStorage.setItem(GAS_KEY, gasDraft);
+              setGasUrl(gasDraft);
+              pushToast("✅ GAS 網址已儲存");
+              setShowSettings(false);
+            }} style={{ background:T.primaryLight, border:"none", borderRadius:7, padding:"8px 16px", color:"#fff", cursor:"pointer", fontWeight:700, fontSize:13 }}>儲存</button>
+          </div>
+          {gasUrl && <div style={{ fontSize:11, marginTop:6, color:T.primaryLight }}>✅ 已設定同步網址</div>}
+          {!gasUrl && <div style={{ fontSize:11, marginTop:6, opacity:.55 }}>未設定時資料僅存於瀏覽器本機</div>}
+        </div>
+      )}
+
+      <div style={{ maxWidth:820, margin:"0 auto", padding:"14px 12px 40px" }}>
+
+        {/* ── 列表頁 ── */}
+        {view === "list" && (
+          <div style={{ animation:"fadeIn .3s ease" }}>
+
+            {/* 搜尋 + 新增 */}
+            <div style={{ display:"flex", gap:8, marginBottom:10 }}>
+              <div style={{ flex:1, position:"relative" }}>
+                <span style={{ position:"absolute", left:12, top:"50%", transform:"translateY(-50%)", color:T.textMuted, fontSize:15, pointerEvents:"none" }}>🔍</span>
+                <input value={search} onChange={e => setSearch(e.target.value)}
+                  placeholder="搜尋姓名、病歷號、電話..."
+                  style={{ width:"100%", padding:"11px 12px 11px 36px", borderRadius:10, border:`1.5px solid ${T.border}`, fontSize:14, background:"#fff", color:T.text }} />
+              </div>
+              <button onClick={() => { setEditing(null); setView("form"); }} style={{
+                background: `linear-gradient(135deg, ${T.primary}, ${T.primaryLight})`,
+                color:"#fff", border:"none", borderRadius:10, padding:"11px 18px",
+                fontSize:14, fontWeight:700, cursor:"pointer", whiteSpace:"nowrap",
+                boxShadow:"0 2px 10px rgba(45,106,79,0.35)",
+              }}>＋ 新增個案</button>
+            </div>
+
+            {/* 排序列 */}
+            <div style={{ display:"flex", gap:6, marginBottom:12, alignItems:"center", flexWrap:"wrap" }}>
+              <span style={{ fontSize:11, color:T.textMuted, marginRight:2 }}>排序：</span>
+              {[["chartNo","病歷號"],["name","姓名"],["admitDate","收案日"],["closeDate","結案日"]].map(([k,lbl]) => (
+                <button key={k} onClick={() => setSortBy(k)} style={{
+                  background: sortBy===k ? T.primary : "#fff",
+                  color: sortBy===k ? "#fff" : T.textMuted,
+                  border: `1.5px solid ${sortBy===k ? T.primary : T.border}`,
+                  borderRadius:16, padding:"4px 12px", fontSize:12, cursor:"pointer",
+                  fontWeight: sortBy===k ? 700 : 400,
+                }}>{lbl}</button>
+              ))}
+              <span style={{ marginLeft:"auto", fontSize:12, color:T.textMuted }}>
+                {filtered.length} 位{patients.length !== filtered.length ? ` / 共 ${patients.length}` : ""}
+              </span>
+            </div>
+
+            {/* 個案列表 */}
+            {filtered.length === 0 ? (
+              <div style={{ textAlign:"center", padding:"60px 0", color:T.textMuted }}>
+                <div style={{ fontSize:48, marginBottom:12 }}>📋</div>
+                <div style={{ fontSize:15 }}>{search || onlyAlert ? "找不到符合的個案" : "尚無資料，點擊「＋ 新增個案」開始"}</div>
+              </div>
+            ) : (
+              filtered.map(p => (
+                <PatientCard key={p.id} p={p} onClick={() => { setEditing(p); setView("detail"); }} />
+              ))
+            )}
+          </div>
+        )}
+
+        {/* ── 新增/編輯 ── */}
+        {view === "form" && (
+          <PatientForm initial={editing} busy={busy}
+            onSave={savePatient}
+            onCancel={() => { setView(editing ? "detail" : "list"); }} />
+        )}
+
+        {/* ── 詳情 ── */}
+        {view === "detail" && editing && (
+          <PatientDetail p={editing}
+            onEdit={() => setView("form")}
+            onDelete={() => setDelTarget(editing.id)}
+            onBack={() => { setView("list"); setEditing(null); }} />
+        )}
+      </div>
+
+      {/* Toast */}
+      {toast && (
+        <div style={{
+          position:"fixed", bottom:24, left:"50%",
+          transform:"translateX(-50%)", zIndex:999,
+          background: toast.type === "danger" ? T.danger : T.primaryDark,
+          color:"#fff", padding:"12px 26px", borderRadius:28,
+          fontSize:14, fontWeight:600,
+          boxShadow:"0 6px 24px rgba(0,0,0,0.25)",
+          animation:"slideUp .3s ease", whiteSpace:"nowrap",
+        }}>{toast.msg}</div>
+      )}
+
+      {/* 刪除確認 */}
+      {delTarget && (
+        <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.55)", display:"flex", alignItems:"center", justifyContent:"center", zIndex:200 }}>
+          <div style={{ background:"#fff", borderRadius:18, padding:28, maxWidth:300, width:"88%", textAlign:"center", boxShadow:"0 8px 32px rgba(0,0,0,0.2)" }}>
+            <div style={{ fontSize:36, marginBottom:10 }}>⚠️</div>
+            <div style={{ fontSize:16, fontWeight:700, marginBottom:8 }}>確認刪除此個案？</div>
+            <div style={{ fontSize:13, color:T.textMuted, marginBottom:22 }}>此操作無法復原</div>
+            <div style={{ display:"flex", gap:10 }}>
+              <button onClick={() => setDelTarget(null)} style={{ flex:1, padding:11, borderRadius:9, border:`1.5px solid ${T.border}`, background:"#fff", cursor:"pointer", fontSize:14 }}>取消</button>
+              <button onClick={() => deletePatient(delTarget)} style={{ flex:1, padding:11, borderRadius:9, border:"none", background:T.danger, color:"#fff", cursor:"pointer", fontWeight:700, fontSize:14 }}>確認刪除</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ────────────────────────────────────────────────────────────
+// 個案卡片
+// ────────────────────────────────────────────────────────────
+function PatientCard({ p, onClick }) {
+  const days    = daysUntil(p.closeDate);
+  const alert30 = days !== null && days <= 30 && days >= 0;
+  const expired = days !== null && days < 0;
+  const [hover, setHover] = useState(false);
+
+  return (
+    <div onClick={onClick}
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
+      style={{
+        background: alert30 ? T.yellow : "#fff",
+        border: `1.5px solid ${alert30 ? T.yellowBorder : hover ? T.primaryLight : T.border}`,
+        borderRadius:12, padding:"13px 16px", marginBottom:9,
+        cursor:"pointer",
+        boxShadow: hover ? "0 4px 18px rgba(0,0,0,0.1)" : alert30 ? "0 2px 12px rgba(255,179,0,.18)" : "0 1px 6px rgba(0,0,0,0.05)",
+        transform: hover ? "translateY(-1px)" : "none",
+        transition:"all .18s ease",
+      }}>
+      <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start" }}>
+        <div style={{ flex:1, minWidth:0 }}>
+          <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:4, flexWrap:"wrap" }}>
+            <span style={{ fontSize:16, fontWeight:700, color:T.text }}>{p.name || "（未填姓名）"}</span>
+            {alert30 && !expired && (
+              <span style={{ background:T.warning, color:"#fff", fontSize:10, fontWeight:700, padding:"2px 9px", borderRadius:10, flexShrink:0 }}>
+                ⚠️ {days} 天後結案
+              </span>
+            )}
+            {expired && (
+              <span style={{ background:T.danger, color:"#fff", fontSize:10, fontWeight:700, padding:"2px 9px", borderRadius:10, flexShrink:0 }}>
+                已結案
+              </span>
+            )}
+          </div>
+          <div style={{ fontSize:12, color:T.textMuted, display:"flex", gap:12, flexWrap:"wrap" }}>
+            {p.chartNo && <span>📋 {p.chartNo}</span>}
+            {p.phone   && <span>📞 {p.phone}</span>}
+            {p.team    && <span>👥 {p.team}</span>}
+          </div>
+        </div>
+        <div style={{ textAlign:"right", fontSize:11, color:T.textMuted, flexShrink:0, marginLeft:10 }}>
+          <div>收案 {fmt(p.admitDate)}</div>
+          <div style={{ color: alert30 ? T.warning : T.textMuted, fontWeight: alert30 ? 700 : 400, marginTop:2 }}>
+            結案 {fmt(p.closeDate)}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ────────────────────────────────────────────────────────────
+// 個案詳情
+// ────────────────────────────────────────────────────────────
+function PatientDetail({ p, onEdit, onDelete, onBack }) {
+  const days    = daysUntil(p.closeDate);
+  const alert30 = days !== null && days <= 30;
+
+  const rows = [
+    ["病歷號", p.chartNo], ["電話", p.phone],
+    ["住址", p.address, true],
+    ["緊急聯絡人", p.contact], ["聯絡人電話", p.contactPhone],
+    ["收案團隊", p.team],
+    ["收案日期", fmt(p.admitDate)], ["結案日期", fmt(p.closeDate)],
+  ];
+
+  return (
+    <div style={{ animation:"fadeIn .25s ease" }}>
+      <button onClick={onBack} style={{ background:"none", border:"none", color:T.primary, fontSize:14, cursor:"pointer", marginBottom:14, fontWeight:600, padding:0 }}>
+        ← 返回列表
+      </button>
+      <div style={{ background:"#fff", borderRadius:16, overflow:"hidden", boxShadow:"0 2px 16px rgba(0,0,0,0.09)" }}>
+        {/* 頭部 */}
+        <div style={{ background:`linear-gradient(135deg, ${T.primaryDark}, ${T.primary})`, padding:"20px 20px 18px", color:"#fff" }}>
+          <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start" }}>
+            <div>
+              <div style={{ fontSize:22, fontWeight:700 }}>{p.name}</div>
+              <div style={{ fontSize:13, opacity:.75, marginTop:3 }}>{p.chartNo || "無病歷號"}</div>
+            </div>
+            {alert30 && days >= 0 && (
+              <div style={{ background:"rgba(255,255,255,0.15)", borderRadius:10, padding:"10px 16px", textAlign:"center", border:`1px solid rgba(255,255,255,0.3)` }}>
+                <div style={{ fontSize:10, opacity:.9 }}>距結案</div>
+                <div style={{ fontSize:22, fontWeight:700, color:"#FFE082" }}>{days} 天</div>
+              </div>
+            )}
+          </div>
+        </div>
+        {/* 資料 */}
+        <div style={{ padding:20 }}>
+          <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:"12px 20px", marginBottom:16 }}>
+            {rows.map(([lbl, val, full]) => (
+              <div key={lbl} style={{ gridColumn: full ? "1 / -1" : "auto", borderBottom:`1px solid ${T.border}`, paddingBottom:8 }}>
+                <div style={{ fontSize:11, color:T.textMuted, marginBottom:2 }}>{lbl}</div>
+                <div style={{ fontSize:14, color: val ? T.text : T.textMuted, fontStyle: val ? "normal" : "italic" }}>{val || "—"}</div>
+              </div>
+            ))}
+          </div>
+          {p.notes && (
+            <div style={{ background:T.bg, borderRadius:9, padding:"10px 14px", marginBottom:16 }}>
+              <div style={{ fontSize:11, color:T.textMuted, marginBottom:4 }}>備註</div>
+              <div style={{ fontSize:13, color:T.text, lineHeight:1.7 }}>{p.notes}</div>
+            </div>
+          )}
+          <div style={{ display:"flex", gap:10 }}>
+            <button onClick={onEdit} style={{
+              flex:1, padding:13, borderRadius:10,
+              background:`linear-gradient(135deg, ${T.primary}, ${T.primaryLight})`,
+              color:"#fff", border:"none", fontSize:15, fontWeight:700, cursor:"pointer",
+            }}>✏️ 編輯</button>
+            <button onClick={onDelete} style={{ padding:"13px 18px", borderRadius:10, background:"#fff", color:T.danger, border:`1.5px solid ${T.danger}`, fontSize:15, cursor:"pointer" }}>🗑️</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ────────────────────────────────────────────────────────────
+// 新增 / 編輯表單
+// ────────────────────────────────────────────────────────────
+function PatientForm({ initial, busy, onSave, onCancel }) {
+  const today = new Date().toISOString().split("T")[0];
+  const [f, setF] = useState({
+    id: initial?.id || "",
+    chartNo: initial?.chartNo || "",
+    name: initial?.name || "",
+    phone: initial?.phone || "",
+    address: initial?.address || "",
+    contact: initial?.contact || "",
+    contactPhone: initial?.contactPhone || "",
+    team: initial?.team || TEAMS[0],
+    admitDate: initial?.admitDate || today,
+    closeDate: initial?.closeDate || "",
+    notes: initial?.notes || "",
+  });
+  const [err, setErr] = useState({});
+
+  const set = (k, v) => { setF(p => ({...p, [k]: v})); setErr(e => ({...e, [k]: ""})); };
+  const autoClose = addDays(f.admitDate, 365);
+
+  const validate = () => {
+    const e = {};
+    if (!f.name.trim())    e.name = "請填寫姓名";
+    if (!f.admitDate)      e.admitDate = "請填寫收案日期";
+    setErr(e);
+    return Object.keys(e).length === 0;
+  };
+
+  const submit = () => { if (validate()) onSave({ ...f, closeDate: f.closeDate || autoClose }); };
+
+  const inp = (err) => ({
+    width:"100%", padding:"10px 12px", borderRadius:8,
+    border: `1.5px solid ${err ? T.danger : T.border}`,
+    fontSize:14, background:"#fff", color:T.text,
+  });
+
+  const Field = ({ label, full, required, errKey, children }) => (
+    <div style={{ gridColumn: full ? "1 / -1" : "auto" }}>
+      <label style={{ display:"block", fontSize:12, color: err[errKey] ? T.danger : T.textMuted, marginBottom:4, fontWeight:600 }}>
+        {label}{required && <span style={{ color:T.danger }}> *</span>}
+      </label>
+      {children}
+      {err[errKey] && <div style={{ fontSize:11, color:T.danger, marginTop:3 }}>{err[errKey]}</div>}
+    </div>
+  );
+
+  return (
+    <div style={{ animation:"fadeIn .25s ease" }}>
+      <button onClick={onCancel} style={{ background:"none", border:"none", color:T.primary, fontSize:14, cursor:"pointer", marginBottom:14, fontWeight:600, padding:0 }}>
+        ← 取消
+      </button>
+      <div style={{ background:"#fff", borderRadius:16, padding:22, boxShadow:"0 2px 16px rgba(0,0,0,0.09)" }}>
+        <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:20, paddingBottom:14, borderBottom:`1px solid ${T.border}` }}>
+          <div style={{ width:36, height:36, background:T.primary, borderRadius:9, display:"flex", alignItems:"center", justifyContent:"center", fontSize:18 }}>
+            {initial ? "✏️" : "➕"}
+          </div>
+          <h2 style={{ fontSize:17, color:T.text }}>{initial ? "編輯個案" : "新增個案"}</h2>
+        </div>
+
+        <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:14, marginBottom:18 }}>
+          <Field label="姓名" required errKey="name">
+            <input style={inp(err.name)} value={f.name} onChange={e => set("name", e.target.value)} placeholder="個案姓名" />
+          </Field>
+          <Field label="病歷號">
+            <input style={inp()} value={f.chartNo} onChange={e => set("chartNo", e.target.value)} placeholder="病歷號碼" />
+          </Field>
+          <Field label="電話">
+            <input style={inp()} value={f.phone} onChange={e => set("phone", e.target.value)} placeholder="聯絡電話" type="tel" />
+          </Field>
+          <Field label="收案團隊">
+            <select style={inp()} value={f.team} onChange={e => set("team", e.target.value)}>
+              {TEAMS.map(t => <option key={t} value={t}>{t}</option>)}
+            </select>
+          </Field>
+          <Field label="住址" full>
+            <input style={inp()} value={f.address} onChange={e => set("address", e.target.value)} placeholder="完整住址" />
+          </Field>
+          <Field label="緊急聯絡人">
+            <input style={inp()} value={f.contact} onChange={e => set("contact", e.target.value)} placeholder="聯絡人姓名" />
+          </Field>
+          <Field label="聯絡人電話">
+            <input style={inp()} value={f.contactPhone} onChange={e => set("contactPhone", e.target.value)} placeholder="聯絡人電話" type="tel" />
+          </Field>
+          <Field label="收案日期" required errKey="admitDate">
+            <input style={inp(err.admitDate)} type="date" value={f.admitDate} onChange={e => set("admitDate", e.target.value)} />
+          </Field>
+          <Field label={`結案日期（留空自動 +365 天 = ${fmt(autoClose)}）`} full>
+            <input style={inp()} type="date" value={f.closeDate} onChange={e => set("closeDate", e.target.value)} />
+          </Field>
+          <Field label="備註" full>
+            <textarea style={{ ...inp(), minHeight:76, resize:"vertical" }}
+              value={f.notes} onChange={e => set("notes", e.target.value)} placeholder="其他備註事項" />
+          </Field>
+        </div>
+
+        <div style={{ display:"flex", gap:10 }}>
+          <button onClick={submit} disabled={busy} style={{
+            flex:1, padding:14, borderRadius:10,
+            background: busy ? "#ccc" : `linear-gradient(135deg, ${T.primary}, ${T.primaryLight})`,
+            color:"#fff", border:"none", fontSize:16, fontWeight:700,
+            cursor: busy ? "not-allowed" : "pointer",
+            boxShadow: busy ? "none" : "0 3px 12px rgba(45,106,79,0.3)",
+          }}>{busy ? "儲存中..." : "💾 儲存個案"}</button>
+          <button onClick={onCancel} style={{ padding:"14px 20px", borderRadius:10, background:"#fff", border:`1.5px solid ${T.border}`, fontSize:14, cursor:"pointer" }}>取消</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── 掛載 ──────────────────────────────────────────────────
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
