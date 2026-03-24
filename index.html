@@ -69,7 +69,7 @@ const loadLocal  = () => { try { return JSON.parse(localStorage.getItem(LOCAL_KE
 const saveLocal  = d => localStorage.setItem(LOCAL_KEY, JSON.stringify(d));
 const GAS_KEY    = "gas_url_v2";
 
-const TEAMS = ["A 團隊", "B 團隊", "C 團隊", "跨團隊"];
+
 
 // ────────────────────────────────────────────────────────────
 // APP ROOT
@@ -129,6 +129,28 @@ function App() {
     syncGAS("delete", { patientId: id });
     pushToast(`🗑️ 已刪除：${p?.name}`, "danger");
     setDelTarget(null); setView("list"); setEditing(null);
+  };
+
+  const closePatient = (id) => {
+    const updated = patients.map(p =>
+      p.id === id ? { ...p, closedAt: new Date().toISOString().split("T")[0] } : p
+    );
+    persist(updated);
+    const p = updated.find(x => x.id === id);
+    syncGAS("update", { patient: p });
+    pushToast(`📁 已結案：${p?.name}`);
+    setEditing(p);
+  };
+
+  const reopenPatient = (id) => {
+    const updated = patients.map(p =>
+      p.id === id ? { ...p, closedAt: "" } : p
+    );
+    persist(updated);
+    const p = updated.find(x => x.id === id);
+    syncGAS("update", { patient: p });
+    pushToast(`🔄 已重新開案：${p?.name}`);
+    setEditing(p);
   };
 
   const alertCount = patients.filter(p => { const d = daysUntil(p.closeDate); return d !== null && d >= 0 && d <= 30; }).length;
@@ -280,6 +302,8 @@ function App() {
           <PatientDetail p={editing}
             onEdit={() => setView("form")}
             onDelete={() => setDelTarget(editing.id)}
+            onClose={() => closePatient(editing.id)}
+            onReopen={() => reopenPatient(editing.id)}
             onBack={() => { setView("list"); setEditing(null); }} />
         )}
       </div>
@@ -319,20 +343,25 @@ function App() {
 // 個案卡片
 // ────────────────────────────────────────────────────────────
 function PatientCard({ p, onClick }) {
-  const days    = daysUntil(p.closeDate);
-  const alert30 = days !== null && days <= 30 && days >= 0;
-  const expired = days !== null && days < 0;
+  const days      = daysUntil(p.closeDate);
+  const manuallyClosed = !!p.closedAt; // 手動結案
+  const expired   = manuallyClosed || (days !== null && days < 0);
+  const alert30   = !expired && days !== null && days <= 30 && days >= 0;
   const [hover, setHover] = useState(false);
+
+  const bg     = expired ? "#EFEFEF" : alert30 ? T.yellow : "#fff";
+  const border = expired ? "#CCCCCC" : alert30 ? T.yellowBorder : hover ? T.primaryLight : T.border;
 
   return (
     <div onClick={onClick}
       onMouseEnter={() => setHover(true)}
       onMouseLeave={() => setHover(false)}
       style={{
-        background: alert30 ? T.yellow : "#fff",
-        border: `1.5px solid ${alert30 ? T.yellowBorder : hover ? T.primaryLight : T.border}`,
+        background: bg,
+        border: `1.5px solid ${border}`,
         borderRadius:12, padding:"13px 16px", marginBottom:9,
         cursor:"pointer",
+        opacity: expired ? 0.7 : 1,
         boxShadow: hover ? "0 4px 18px rgba(0,0,0,0.1)" : alert30 ? "0 2px 12px rgba(255,179,0,.18)" : "0 1px 6px rgba(0,0,0,0.05)",
         transform: hover ? "translateY(-1px)" : "none",
         transition:"all .18s ease",
@@ -340,14 +369,14 @@ function PatientCard({ p, onClick }) {
       <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start" }}>
         <div style={{ flex:1, minWidth:0 }}>
           <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:4, flexWrap:"wrap" }}>
-            <span style={{ fontSize:16, fontWeight:700, color:T.text }}>{p.name || "（未填姓名）"}</span>
-            {alert30 && !expired && (
+            <span style={{ fontSize:16, fontWeight:700, color: expired ? "#888" : T.text }}>{p.name || "（未填姓名）"}</span>
+            {alert30 && (
               <span style={{ background:T.warning, color:"#fff", fontSize:10, fontWeight:700, padding:"2px 9px", borderRadius:10, flexShrink:0 }}>
                 ⚠️ {days} 天後結案
               </span>
             )}
             {expired && (
-              <span style={{ background:T.danger, color:"#fff", fontSize:10, fontWeight:700, padding:"2px 9px", borderRadius:10, flexShrink:0 }}>
+              <span style={{ background:"#999", color:"#fff", fontSize:10, fontWeight:700, padding:"2px 9px", borderRadius:10, flexShrink:0 }}>
                 已結案
               </span>
             )}
@@ -372,15 +401,17 @@ function PatientCard({ p, onClick }) {
 // ────────────────────────────────────────────────────────────
 // 個案詳情
 // ────────────────────────────────────────────────────────────
-function PatientDetail({ p, onEdit, onDelete, onBack }) {
+function PatientDetail({ p, onEdit, onDelete, onClose, onReopen, onBack }) {
   const days    = daysUntil(p.closeDate);
-  const alert30 = days !== null && days <= 30;
+  const manuallyClosed = !!p.closedAt;
+  const alert30 = !manuallyClosed && days !== null && days <= 30 && days >= 0;
 
   const rows = [
     ["病歷號", p.chartNo], ["電話", p.phone],
     ["住址", p.address, true],
     ["緊急聯絡人", p.contact], ["聯絡人電話", p.contactPhone],
-    ["收案團隊", p.team],
+    ["收案團隊", p.team], ["轉介單位", p.referral],
+    ["西醫診所", p.clinic], ["主要病症", p.diagnosis],
     ["收案日期", fmt(p.admitDate)], ["結案日期", fmt(p.closeDate)],
   ];
 
@@ -389,15 +420,19 @@ function PatientDetail({ p, onEdit, onDelete, onBack }) {
       <button onClick={onBack} style={{ background:"none", border:"none", color:T.primary, fontSize:14, cursor:"pointer", marginBottom:14, fontWeight:600, padding:0 }}>
         ← 返回列表
       </button>
-      <div style={{ background:"#fff", borderRadius:16, overflow:"hidden", boxShadow:"0 2px 16px rgba(0,0,0,0.09)" }}>
+      <div style={{ background: manuallyClosed ? "#F0F0F0" : "#fff", borderRadius:16, overflow:"hidden", boxShadow:"0 2px 16px rgba(0,0,0,0.09)" }}>
         {/* 頭部 */}
-        <div style={{ background:`linear-gradient(135deg, ${T.primaryDark}, ${T.primary})`, padding:"20px 20px 18px", color:"#fff" }}>
+        <div style={{ background: manuallyClosed ? "linear-gradient(135deg, #777, #999)" : `linear-gradient(135deg, ${T.primaryDark}, ${T.primary})`, padding:"20px 20px 18px", color:"#fff" }}>
           <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start" }}>
             <div>
-              <div style={{ fontSize:22, fontWeight:700 }}>{p.name}</div>
+              <div style={{ display:"flex", alignItems:"center", gap:8 }}>
+                <div style={{ fontSize:22, fontWeight:700 }}>{p.name}</div>
+                {manuallyClosed && <span style={{ background:"rgba(255,255,255,0.25)", fontSize:11, fontWeight:700, padding:"2px 10px", borderRadius:10 }}>已結案</span>}
+              </div>
               <div style={{ fontSize:13, opacity:.75, marginTop:3 }}>{p.chartNo || "無病歷號"}</div>
+              {manuallyClosed && p.closedAt && <div style={{ fontSize:12, opacity:.8, marginTop:4 }}>結案日期：{fmt(p.closedAt)}</div>}
             </div>
-            {alert30 && days >= 0 && (
+            {alert30 && (
               <div style={{ background:"rgba(255,255,255,0.15)", borderRadius:10, padding:"10px 16px", textAlign:"center", border:`1px solid rgba(255,255,255,0.3)` }}>
                 <div style={{ fontSize:10, opacity:.9 }}>距結案</div>
                 <div style={{ fontSize:22, fontWeight:700, color:"#FFE082" }}>{days} 天</div>
@@ -422,11 +457,28 @@ function PatientDetail({ p, onEdit, onDelete, onBack }) {
             </div>
           )}
           <div style={{ display:"flex", gap:10 }}>
-            <button onClick={onEdit} style={{
-              flex:1, padding:13, borderRadius:10,
-              background:`linear-gradient(135deg, ${T.primary}, ${T.primaryLight})`,
-              color:"#fff", border:"none", fontSize:15, fontWeight:700, cursor:"pointer",
-            }}>✏️ 編輯</button>
+            {!manuallyClosed && (
+              <button onClick={onEdit} style={{
+                flex:1, padding:13, borderRadius:10,
+                background:`linear-gradient(135deg, ${T.primary}, ${T.primaryLight})`,
+                color:"#fff", border:"none", fontSize:15, fontWeight:700, cursor:"pointer",
+              }}>✏️ 編輯</button>
+            )}
+            {manuallyClosed ? (
+              <button onClick={onReopen} style={{
+                flex:1, padding:13, borderRadius:10,
+                background:"#fff", color:T.primary,
+                border:`1.5px solid ${T.primary}`,
+                fontSize:15, fontWeight:700, cursor:"pointer",
+              }}>🔄 重新開案</button>
+            ) : (
+              <button onClick={onClose} style={{
+                flex:1, padding:13, borderRadius:10,
+                background:"#fff", color:"#777",
+                border:"1.5px solid #ccc",
+                fontSize:15, fontWeight:700, cursor:"pointer",
+              }}>📁 結案</button>
+            )}
             <button onClick={onDelete} style={{ padding:"13px 18px", borderRadius:10, background:"#fff", color:T.danger, border:`1.5px solid ${T.danger}`, fontSize:15, cursor:"pointer" }}>🗑️</button>
           </div>
         </div>
@@ -469,7 +521,10 @@ function PatientForm({ initial, busy, onSave, onCancel }) {
     address: initial?.address || "",
     contact: initial?.contact || "",
     contactPhone: initial?.contactPhone || "",
-    team: initial?.team || TEAMS[0],
+    team: initial?.team || "",
+    referral: initial?.referral || "",
+    clinic: initial?.clinic || "",
+    diagnosis: initial?.diagnosis || "",
     admitDate: initial?.admitDate || today,
     closeDate: initial?.closeDate || "",
     notes: initial?.notes || "",
@@ -513,9 +568,7 @@ function PatientForm({ initial, busy, onSave, onCancel }) {
             <input style={inpStyle()} value={f.phone} onChange={e => set("phone", e.target.value)} placeholder="聯絡電話" type="tel" />
           </FormField>
           <FormField label="收案團隊">
-            <select style={inpStyle()} value={f.team} onChange={e => set("team", e.target.value)}>
-              {TEAMS.map(t => <option key={t} value={t}>{t}</option>)}
-            </select>
+            <input style={inpStyle()} value={f.team} onChange={e => set("team", e.target.value)} placeholder="例：A 團隊" />
           </FormField>
           <FormField label="住址" full>
             <input style={inpStyle()} value={f.address} onChange={e => set("address", e.target.value)} placeholder="完整住址" />
@@ -525,6 +578,15 @@ function PatientForm({ initial, busy, onSave, onCancel }) {
           </FormField>
           <FormField label="聯絡人電話">
             <input style={inpStyle()} value={f.contactPhone} onChange={e => set("contactPhone", e.target.value)} placeholder="聯絡人電話" type="tel" />
+          </FormField>
+          <FormField label="轉介單位">
+            <input style={inpStyle()} value={f.referral} onChange={e => set("referral", e.target.value)} placeholder="轉介單位名稱" />
+          </FormField>
+          <FormField label="西醫診所">
+            <input style={inpStyle()} value={f.clinic} onChange={e => set("clinic", e.target.value)} placeholder="西醫診所名稱" />
+          </FormField>
+          <FormField label="主要病症" full>
+            <input style={inpStyle()} value={f.diagnosis} onChange={e => set("diagnosis", e.target.value)} placeholder="例：腦中風後遺症、骨折術後..." />
           </FormField>
           <FormField label="收案日期" required hasErr={!!err.admitDate} errMsg={err.admitDate}>
             <input style={inpStyle(err.admitDate)} type="date" value={f.admitDate} onChange={e => set("admitDate", e.target.value)} />
