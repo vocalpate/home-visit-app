@@ -436,6 +436,27 @@ function PatientDetail({ p, onEdit, onDelete, onBack }) {
 }
 
 // ────────────────────────────────────────────────────────────
+// Field 元件（必須在 PatientForm 外部定義，避免游標跳動 bug）
+// ────────────────────────────────────────────────────────────
+function FormField({ label, full, required, hasErr, errMsg, children }) {
+  return (
+    <div style={{ gridColumn: full ? "1 / -1" : "auto" }}>
+      <label style={{ display:"block", fontSize:12, color: hasErr ? T.danger : T.textMuted, marginBottom:4, fontWeight:600 }}>
+        {label}{required && <span style={{ color:T.danger }}> *</span>}
+      </label>
+      {children}
+      {hasErr && <div style={{ fontSize:11, color:T.danger, marginTop:3 }}>{errMsg}</div>}
+    </div>
+  );
+}
+
+const inpStyle = (hasErr) => ({
+  width:"100%", padding:"10px 12px", borderRadius:8,
+  border: `1.5px solid ${hasErr ? T.danger : T.border}`,
+  fontSize:14, background:"#fff", color:T.text,
+});
+
+// ────────────────────────────────────────────────────────────
 // 新增 / 編輯表單
 // ────────────────────────────────────────────────────────────
 function PatientForm({ initial, busy, onSave, onCancel }) {
@@ -460,29 +481,13 @@ function PatientForm({ initial, busy, onSave, onCancel }) {
 
   const validate = () => {
     const e = {};
-    if (!f.name.trim())    e.name = "請填寫姓名";
-    if (!f.admitDate)      e.admitDate = "請填寫收案日期";
+    if (!f.name.trim()) e.name = "請填寫姓名";
+    if (!f.admitDate)   e.admitDate = "請填寫收案日期";
     setErr(e);
     return Object.keys(e).length === 0;
   };
 
   const submit = () => { if (validate()) onSave({ ...f, closeDate: f.closeDate || autoClose }); };
-
-  const inp = (err) => ({
-    width:"100%", padding:"10px 12px", borderRadius:8,
-    border: `1.5px solid ${err ? T.danger : T.border}`,
-    fontSize:14, background:"#fff", color:T.text,
-  });
-
-  const Field = ({ label, full, required, errKey, children }) => (
-    <div style={{ gridColumn: full ? "1 / -1" : "auto" }}>
-      <label style={{ display:"block", fontSize:12, color: err[errKey] ? T.danger : T.textMuted, marginBottom:4, fontWeight:600 }}>
-        {label}{required && <span style={{ color:T.danger }}> *</span>}
-      </label>
-      {children}
-      {err[errKey] && <div style={{ fontSize:11, color:T.danger, marginTop:3 }}>{err[errKey]}</div>}
-    </div>
-  );
 
   return (
     <div style={{ animation:"fadeIn .25s ease" }}>
@@ -498,39 +503,39 @@ function PatientForm({ initial, busy, onSave, onCancel }) {
         </div>
 
         <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:14, marginBottom:18 }}>
-          <Field label="姓名" required errKey="name">
-            <input style={inp(err.name)} value={f.name} onChange={e => set("name", e.target.value)} placeholder="個案姓名" />
-          </Field>
-          <Field label="病歷號">
-            <input style={inp()} value={f.chartNo} onChange={e => set("chartNo", e.target.value)} placeholder="病歷號碼" />
-          </Field>
-          <Field label="電話">
-            <input style={inp()} value={f.phone} onChange={e => set("phone", e.target.value)} placeholder="聯絡電話" type="tel" />
-          </Field>
-          <Field label="收案團隊">
-            <select style={inp()} value={f.team} onChange={e => set("team", e.target.value)}>
+          <FormField label="姓名" required hasErr={!!err.name} errMsg={err.name}>
+            <input style={inpStyle(err.name)} value={f.name} onChange={e => set("name", e.target.value)} placeholder="個案姓名" />
+          </FormField>
+          <FormField label="病歷號">
+            <input style={inpStyle()} value={f.chartNo} onChange={e => set("chartNo", e.target.value)} placeholder="病歷號碼" />
+          </FormField>
+          <FormField label="電話">
+            <input style={inpStyle()} value={f.phone} onChange={e => set("phone", e.target.value)} placeholder="聯絡電話" type="tel" />
+          </FormField>
+          <FormField label="收案團隊">
+            <select style={inpStyle()} value={f.team} onChange={e => set("team", e.target.value)}>
               {TEAMS.map(t => <option key={t} value={t}>{t}</option>)}
             </select>
-          </Field>
-          <Field label="住址" full>
-            <input style={inp()} value={f.address} onChange={e => set("address", e.target.value)} placeholder="完整住址" />
-          </Field>
-          <Field label="緊急聯絡人">
-            <input style={inp()} value={f.contact} onChange={e => set("contact", e.target.value)} placeholder="聯絡人姓名" />
-          </Field>
-          <Field label="聯絡人電話">
-            <input style={inp()} value={f.contactPhone} onChange={e => set("contactPhone", e.target.value)} placeholder="聯絡人電話" type="tel" />
-          </Field>
-          <Field label="收案日期" required errKey="admitDate">
-            <input style={inp(err.admitDate)} type="date" value={f.admitDate} onChange={e => set("admitDate", e.target.value)} />
-          </Field>
-          <Field label={`結案日期（留空自動 +365 天 = ${fmt(autoClose)}）`} full>
-            <input style={inp()} type="date" value={f.closeDate} onChange={e => set("closeDate", e.target.value)} />
-          </Field>
-          <Field label="備註" full>
-            <textarea style={{ ...inp(), minHeight:76, resize:"vertical" }}
+          </FormField>
+          <FormField label="住址" full>
+            <input style={inpStyle()} value={f.address} onChange={e => set("address", e.target.value)} placeholder="完整住址" />
+          </FormField>
+          <FormField label="緊急聯絡人">
+            <input style={inpStyle()} value={f.contact} onChange={e => set("contact", e.target.value)} placeholder="聯絡人姓名" />
+          </FormField>
+          <FormField label="聯絡人電話">
+            <input style={inpStyle()} value={f.contactPhone} onChange={e => set("contactPhone", e.target.value)} placeholder="聯絡人電話" type="tel" />
+          </FormField>
+          <FormField label="收案日期" required hasErr={!!err.admitDate} errMsg={err.admitDate}>
+            <input style={inpStyle(err.admitDate)} type="date" value={f.admitDate} onChange={e => set("admitDate", e.target.value)} />
+          </FormField>
+          <FormField label={`結案日期（留空自動 +365 天 = ${fmt(autoClose)}）`} full>
+            <input style={inpStyle()} type="date" value={f.closeDate} onChange={e => set("closeDate", e.target.value)} />
+          </FormField>
+          <FormField label="備註" full>
+            <textarea style={{ ...inpStyle(), minHeight:76, resize:"vertical" }}
               value={f.notes} onChange={e => set("notes", e.target.value)} placeholder="其他備註事項" />
-          </Field>
+          </FormField>
         </div>
 
         <div style={{ display:"flex", gap:10 }}>
