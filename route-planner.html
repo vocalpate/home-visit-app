@@ -1,0 +1,734 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0" />
+  <meta name="theme-color" content="#1565C0" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-title" content="路線規劃" />
+  <title>居家訪視路線規劃</title>
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Serif+TC:wght@400;600;700&display=swap" rel="stylesheet" />
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { height: 100%; background: #F0F4FF; font-family: 'Noto Serif TC', Georgia, serif; }
+    #root { min-height: 100vh; }
+    input, select, textarea, button { font-family: inherit; }
+    @keyframes fadeIn { from { opacity:0; transform:translateY(8px); } to { opacity:1; transform:translateY(0); } }
+    @keyframes slideUp { from { transform:translateX(-50%) translateY(20px); opacity:0; } to { transform:translateX(-50%) translateY(0); opacity:1; } }
+    input:focus, select:focus { outline: 2px solid #1976D2 !important; outline-offset: 1px; }
+    ::-webkit-scrollbar { width:6px; }
+    ::-webkit-scrollbar-thumb { background:#90CAF9; border-radius:3px; }
+    .day-tab { padding:8px 14px; border:none; border-radius:20px; cursor:pointer; font-size:13px; font-weight:600; transition:all .2s; }
+    .day-tab.active { background:#1565C0; color:#fff; box-shadow:0 2px 8px rgba(21,101,192,0.35); }
+    .day-tab.inactive { background:#fff; color:#5C6BC0; border:1.5px solid #C5CAE9; }
+  </style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useCallback, useRef } = React;
+
+// ── 常數 ────────────────────────────────────────────────────
+// API 金鑰從 localStorage 讀取，不寫死在程式碼中
+const getApiKey = () => localStorage.getItem("gmaps_api_key") || "";
+const LOCAL_KEY_PATIENTS = "home_visit_v2";       // 與個案管理 App 共用
+const LOCAL_KEY_SCHEDULE = "route_schedule_v1";   // 本 App 的設定
+const DAYS = ["週一","週二","週三","週四","週五"];
+const DAY_KEYS = ["mon","tue","wed","thu","fri"];
+
+const T = {
+  bg:"#F0F4FF", primary:"#1565C0", primaryLight:"#1976D2", primaryDark:"#0D47A1",
+  accent:"#FF6F00", success:"#2E7D32", danger:"#C62828", warning:"#E65100",
+  text:"#1A237E", textMuted:"#546E7A", border:"#C5CAE9", card:"#FFFFFF",
+};
+
+// ── 工具 ────────────────────────────────────────────────────
+const fmt = ds => { if(!ds) return "—"; const [y,m,d]=ds.split("-"); return `${y}/${m}/${d}`; };
+const loadLocal = k => { try { return JSON.parse(localStorage.getItem(k)||"null"); } catch { return null; } };
+const saveLocal = (k,v) => localStorage.setItem(k, JSON.stringify(v));
+
+function minsToTime(mins) {
+  const h = Math.floor(mins/60).toString().padStart(2,"0");
+  const m = (mins%60).toString().padStart(2,"0");
+  return `${h}:${m}`;
+}
+function timeToMins(t) {
+  if (!t) return 0;
+  const [h,m] = t.split(":").map(Number);
+  return h*60 + m;
+}
+
+// ── Geocoding（地址 → 座標）────────────────────────────────
+async function geocode(address) {
+  const key = getApiKey();
+  if (!key) throw new Error("尚未設定 Google Maps API 金鑰");
+  const url = `https://maps.googleapis.com/maps/api/geocode/json?address=${encodeURIComponent(address)}&key=${key}&language=zh-TW&region=TW`;
+  const res = await fetch(url);
+  const data = await res.json();
+  if (data.status === "OK" && data.results.length > 0) {
+    return data.results[0].geometry.location;
+  }
+  return null;
+}
+
+// ── Distance Matrix（多點間行車時間）────────────────────────
+async function getDistanceMatrix(origins, destinations) {
+  const key = getApiKey();
+  const orig = origins.map(o => `${o.lat},${o.lng}`).join("|");
+  const dest = destinations.map(d => `${d.lat},${d.lng}`).join("|");
+  const url = `https://maps.googleapis.com/maps/api/distancematrix/json?origins=${encodeURIComponent(orig)}&destinations=${encodeURIComponent(dest)}&key=${key}&language=zh-TW&region=TW&mode=driving`;
+  const res = await fetch(url);
+  const data = await res.json();
+  return data; // rows[i].elements[j].duration.value (seconds)
+}
+
+// ── 路線規劃演算法（貪心 + 時間窗口）───────────────────────
+function planDay(dayKey, patients, coords, startCoord, endCoord, settings) {
+  const { startTime, endTime, visitMins } = settings;
+  const startM = timeToMins(startTime);
+  const endM   = timeToMins(endTime);
+
+  // 篩出今天可看的患者
+  const available = patients.filter(p => {
+    const s = p.schedule || {};
+    return s[dayKey] && s[dayKey].enabled &&
+           s.windowStart && s.windowEnd;
+  });
+
+  if (available.length === 0) return { route:[], unscheduled:[] };
+
+  // 貪心：每次從目前位置選最近且時間窗口符合的患者
+  let currentCoord = startCoord;
+  let currentTime  = startM;
+  const route = [];
+  const remaining = [...available];
+  const unscheduled = [];
+
+  // 預建距離快取（從 coords 中取得）
+  function travelMins(from, to) {
+    // 用直線距離估算（每公里約2分鐘，高雄市區）
+    const R = 6371;
+    const dLat = (to.lat - from.lat) * Math.PI / 180;
+    const dLng = (to.lng - from.lng) * Math.PI / 180;
+    const a = Math.sin(dLat/2)**2 + Math.cos(from.lat*Math.PI/180)*Math.cos(to.lat*Math.PI/180)*Math.sin(dLng/2)**2;
+    const km = R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+    return Math.ceil(km * 2); // 高雄市區約每公里2分鐘
+  }
+
+  while (remaining.length > 0) {
+    let best = null, bestIdx = -1, bestArrival = Infinity;
+
+    remaining.forEach((p, i) => {
+      const coord = coords[p.id];
+      if (!coord) return;
+      const travel = travelMins(currentCoord, coord);
+      const arrival = currentTime + travel;
+      const s = p.schedule;
+      const winStart = timeToMins(s.windowStart);
+      const winEnd   = timeToMins(s.windowEnd);
+      const pVisit   = s.visitMins || visitMins;
+
+      // 可以等到窗口開始
+      const start = Math.max(arrival, winStart);
+      const finish = start + pVisit;
+
+      // 看完後要能趕到終點
+      const toEnd = endCoord ? travelMins(coord, endCoord) : 0;
+
+      if (finish + toEnd <= endM && finish <= winEnd) {
+        // 選最早完成的（貪心）
+        if (finish < bestArrival) {
+          best = p; bestIdx = i; bestArrival = finish;
+          best._arrival = arrival;
+          best._start   = start;
+          best._finish  = finish;
+          best._travel  = travel;
+        }
+      }
+    });
+
+    if (!best) {
+      // 剩餘都排不進去
+      remaining.forEach(p => unscheduled.push({ patient:p, reason:"時間窗口或行程時間不足" }));
+      break;
+    }
+
+    route.push({
+      patient: best,
+      arrival: best._arrival,
+      start:   best._start,
+      finish:  best._finish,
+      travel:  best._travel,
+      coord:   coords[best.id],
+    });
+    currentCoord = coords[best.id];
+    currentTime  = best._finish;
+    remaining.splice(bestIdx, 1);
+  }
+
+  return { route, unscheduled };
+}
+
+// ════════════════════════════════════════════════════════════
+// APP
+// ════════════════════════════════════════════════════════════
+function App() {
+  const [patients, setPatients] = useState([]);
+  const [scheduleData, setScheduleData] = useState({});  // patientId → schedule settings
+  const [view, setView] = useState("setup"); // setup | schedule | result
+  const [activeDay, setActiveDay] = useState("mon");
+  const [toast, setToast] = useState(null);
+  const [planning, setPlanning] = useState(false);
+  const [result, setResult] = useState(null); // { mon:{ route, unscheduled }, ... }
+
+  // 全域設定
+  const [settings, setSettings] = useState(() => loadLocal("route_settings_v1") || {
+    startAddress: "",
+    endAddress:   "",
+    startTime:    "09:00",
+    endTime:      "18:00",
+    visitMins:    25,
+  });
+
+  useEffect(() => {
+    // 載入個案資料（與個案管理 App 共用）
+    const pts = loadLocal(LOCAL_KEY_PATIENTS) || [];
+    setPatients(pts.filter(p => !p.closedAt)); // 只顯示在案中的
+    // 載入排程設定
+    setScheduleData(loadLocal(LOCAL_KEY_SCHEDULE) || {});
+  }, []);
+
+  useEffect(() => {
+    if (!toast) return;
+    const t = setTimeout(() => setToast(null), 3500);
+    return () => clearTimeout(t);
+  }, [toast]);
+
+  const pushToast = (msg, type="ok") => setToast({msg, type});
+
+  const saveSettings = (s) => {
+    setSettings(s);
+    saveLocal("route_settings_v1", s);
+  };
+
+  const saveSchedule = (pid, data) => {
+    const next = { ...scheduleData, [pid]: data };
+    setScheduleData(next);
+    saveLocal(LOCAL_KEY_SCHEDULE, next);
+  };
+
+  // 取得某天已選患者
+  const getPatientsForDay = (dayKey) =>
+    patients.filter(p => {
+      const s = scheduleData[p.id];
+      return s && s[dayKey] && s[dayKey].enabled;
+    });
+
+  // ── 開始規劃 ──────────────────────────────────────────────
+  const startPlanning = async () => {
+    if (!getApiKey()) { pushToast("⚠️ 請先在設定中填入 Google Maps API 金鑰", "danger"); return; }
+    if (!settings.startAddress) { pushToast("⚠️ 請填寫出發地點", "danger"); return; }
+
+    setPlanning(true);
+    pushToast("🗺️ 正在換算地址座標...");
+
+    try {
+      // 1. 收集所有需要 geocode 的地址
+      const allPatients = patients.filter(p => {
+        const s = scheduleData[p.id];
+        return s && DAY_KEYS.some(dk => s[dk]?.enabled);
+      });
+
+      // 2. Geocode 出發地 & 結束地
+      const startCoord = await geocode(settings.startAddress);
+      if (!startCoord) { pushToast("❌ 無法解析出發地址，請確認地址正確", "danger"); setPlanning(false); return; }
+
+      let endCoord = startCoord;
+      if (settings.endAddress && settings.endAddress !== settings.startAddress) {
+        endCoord = await geocode(settings.endAddress) || startCoord;
+      }
+
+      // 3. Geocode 所有患者地址
+      pushToast("🏠 正在換算患者地址...");
+      const coords = {};
+      for (const p of allPatients) {
+        if (p.address) {
+          const c = await geocode(p.address);
+          if (c) coords[p.id] = c;
+        }
+      }
+
+      // 4. 每天規劃
+      pushToast("📅 正在規劃路線...");
+      const res = {};
+      for (const dk of DAY_KEYS) {
+        const dayPatients = patients.filter(p => {
+          const s = scheduleData[p.id];
+          return s && s[dk]?.enabled && coords[p.id];
+        });
+        res[dk] = planDay(dk, dayPatients, coords, startCoord, endCoord, settings);
+        res[dk].startCoord = startCoord;
+        res[dk].endCoord   = endCoord;
+      }
+
+      setResult(res);
+      setView("result");
+      setActiveDay("mon");
+      pushToast("✅ 路線規劃完成！");
+    } catch (err) {
+      console.error(err);
+      pushToast("❌ 規劃失敗：" + err.message, "danger");
+    }
+    setPlanning(false);
+  };
+
+  // ── 產生 Google Maps 導航連結 ─────────────────────────────
+  const getMapsUrl = (dayKey) => {
+    if (!result || !result[dayKey]) return "#";
+    const r = result[dayKey];
+    if (r.route.length === 0) return "#";
+    const waypoints = r.route.map(s => encodeURIComponent(s.patient.address)).join("|");
+    const origin    = encodeURIComponent(settings.startAddress);
+    const dest      = encodeURIComponent(settings.endAddress || r.route[r.route.length-1].patient.address);
+    return `https://www.google.com/maps/dir/?api=1&origin=${origin}&destination=${dest}&waypoints=${waypoints}&travelmode=driving`;
+  };
+
+  return (
+    <div style={{ minHeight:"100vh", background:T.bg }}>
+      {/* Header */}
+      <header style={{ background:`linear-gradient(135deg,${T.primaryDark},${T.primary})`, color:"#fff", padding:"14px 16px", display:"flex", alignItems:"center", justifyContent:"space-between", boxShadow:"0 3px 16px rgba(0,0,0,0.2)", position:"sticky", top:0, zIndex:100 }}>
+        <div style={{ display:"flex", alignItems:"center", gap:10 }}>
+          <div style={{ background:"rgba(255,255,255,0.15)", borderRadius:10, width:38, height:38, display:"flex", alignItems:"center", justifyContent:"center", fontSize:20 }}>🗺️</div>
+          <div>
+            <div style={{ fontSize:15, fontWeight:700 }}>居家訪視路線規劃</div>
+            <div style={{ fontSize:10, opacity:.7 }}>Home Visit Route Planner</div>
+          </div>
+        </div>
+        <div style={{ display:"flex", gap:6 }}>
+          {["setup","schedule","result"].map((v,i) => (
+            <button key={v} onClick={()=>setView(v)} style={{
+              background: view===v?"rgba(255,255,255,0.25)":"rgba(255,255,255,0.08)",
+              border:`1px solid ${view===v?"rgba(255,255,255,0.5)":"rgba(255,255,255,0.2)"}`,
+              color:"#fff", borderRadius:8, padding:"5px 10px", fontSize:11, cursor:"pointer", fontWeight: view===v?700:400,
+            }}>{["設定","排班","結果"][i]}</button>
+          ))}
+        </div>
+      </header>
+
+      <div style={{ maxWidth:860, margin:"0 auto", padding:"16px 12px 60px" }}>
+
+        {/* ── 設定頁 ── */}
+        {view === "setup" && (
+          <SetupView settings={settings} onSave={saveSettings} patients={patients}
+            scheduleData={scheduleData} onSaveSchedule={saveSchedule}
+            onPlan={startPlanning} planning={planning} />
+        )}
+
+        {/* ── 排班頁（設定每位患者可看診時間）── */}
+        {view === "schedule" && (
+          <ScheduleView patients={patients} scheduleData={scheduleData}
+            onSave={saveSchedule} defaultVisitMins={settings.visitMins} />
+        )}
+
+        {/* ── 結果頁 ── */}
+        {view === "result" && result && (
+          <ResultView result={result} settings={settings}
+            activeDay={activeDay} setActiveDay={setActiveDay}
+            getMapsUrl={getMapsUrl} />
+        )}
+
+        {view === "result" && !result && (
+          <div style={{ textAlign:"center", padding:"80px 0", color:T.textMuted }}>
+            <div style={{ fontSize:48, marginBottom:12 }}>📋</div>
+            <div style={{ fontSize:15 }}>尚未規劃路線，請先到「設定」頁完成設定後按「開始規劃」</div>
+          </div>
+        )}
+      </div>
+
+      {toast && (
+        <div style={{ position:"fixed", bottom:24, left:"50%", transform:"translateX(-50%)", zIndex:999, background:toast.type==="danger"?T.danger:T.primaryDark, color:"#fff", padding:"12px 26px", borderRadius:28, fontSize:14, fontWeight:600, boxShadow:"0 6px 24px rgba(0,0,0,0.25)", animation:"slideUp .3s ease", whiteSpace:"nowrap" }}>{toast.msg}</div>
+      )}
+    </div>
+  );
+}
+
+// ════════════════════════════════════════════════════════════
+// 設定頁
+// ════════════════════════════════════════════════════════════
+function SetupView({ settings, onSave, patients, scheduleData, onSaveSchedule, onPlan, planning }) {
+  const [s, setS] = useState(settings);
+  const set = (k,v) => setS(p=>({...p,[k]:v}));
+  const [apiKey, setApiKey] = useState(() => localStorage.getItem("gmaps_api_key") || "");
+  const [showKey, setShowKey] = useState(false);
+  const [keySaved, setKeySaved] = useState(!!localStorage.getItem("gmaps_api_key"));
+
+  const saveApiKey = () => {
+    localStorage.setItem("gmaps_api_key", apiKey.trim());
+    setKeySaved(true);
+    setTimeout(() => setKeySaved(false), 2000);
+  };
+
+  const scheduledCount = patients.filter(p => {
+    const sd = scheduleData[p.id];
+    return sd && DAY_KEYS.some(dk => sd[dk]?.enabled);
+  }).length;
+
+  const inp = { width:"100%", padding:"10px 12px", borderRadius:8, border:`1.5px solid ${T.border}`, fontSize:14, background:"#fff", color:T.text };
+
+  return (
+    <div style={{ animation:"fadeIn .3s ease" }}>
+
+      {/* API 金鑰設定（安全存放於本機，不寫入程式碼）*/}
+      <div style={{ background:T.card, borderRadius:16, padding:20, boxShadow:"0 2px 16px rgba(0,0,0,0.08)", marginBottom:14, border: getApiKey()?"none":`2px solid ${T.danger}` }}>
+        <h2 style={{ fontSize:16, color:T.primary, marginBottom:6, display:"flex", alignItems:"center", gap:8 }}>
+          <span>🔑</span> Google Maps API 金鑰
+          {getApiKey()
+            ? <span style={{ fontSize:11, background:"#E8F5E9", color:T.success, padding:"2px 8px", borderRadius:8, fontWeight:600 }}>✅ 已設定</span>
+            : <span style={{ fontSize:11, background:"#FFEBEE", color:T.danger, padding:"2px 8px", borderRadius:8, fontWeight:600 }}>⚠️ 未設定</span>
+          }
+        </h2>
+        <div style={{ fontSize:12, color:T.textMuted, marginBottom:10 }}>
+          金鑰僅存在你的瀏覽器本機（localStorage），不會上傳或寫入程式碼，請放心填入。
+        </div>
+        <div style={{ display:"flex", gap:8 }}>
+          <input
+            type={showKey ? "text" : "password"}
+            value={apiKey}
+            onChange={e=>setApiKey(e.target.value)}
+            placeholder="貼上 Google Maps API 金鑰..."
+            style={{ ...inp, flex:1, fontFamily:"monospace", fontSize:13 }}
+          />
+          <button onClick={()=>setShowKey(v=>!v)} style={{ padding:"10px 12px", borderRadius:8, border:`1.5px solid ${T.border}`, background:"#fff", cursor:"pointer", fontSize:14 }}>
+            {showKey?"🙈":"👁️"}
+          </button>
+          <button onClick={saveApiKey} style={{ padding:"10px 16px", borderRadius:8, border:"none", background: keySaved?"#2E7D32":T.primaryLight, color:"#fff", cursor:"pointer", fontWeight:700, fontSize:13, whiteSpace:"nowrap" }}>
+            {keySaved ? "✅ 已儲存" : "儲存"}
+          </button>
+        </div>
+        {apiKey && (
+          <button onClick={()=>{ localStorage.removeItem("gmaps_api_key"); setApiKey(""); }} style={{ marginTop:8, background:"none", border:"none", color:T.danger, fontSize:12, cursor:"pointer", textDecoration:"underline" }}>
+            清除金鑰
+          </button>
+        )}
+      </div>
+
+      <div style={{ background:T.card, borderRadius:16, padding:22, boxShadow:"0 2px 16px rgba(0,0,0,0.08)", marginBottom:14 }}>
+        <h2 style={{ fontSize:16, color:T.primary, marginBottom:16, display:"flex", alignItems:"center", gap:8 }}>
+          <span>⚙️</span> 每日行程設定
+        </h2>
+        <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:12 }}>
+          {[["startAddress","出發地點","例：高雄市三民區建工路"],["endAddress","結束地點（留空＝同出發地）","例：高雄市鳳山區光遠路"]].map(([k,lbl,ph])=>(
+            <div key={k} style={{ gridColumn:"1 / -1" }}>
+              <label style={{ fontSize:12, color:T.textMuted, fontWeight:600, display:"block", marginBottom:4 }}>{lbl}</label>
+              <input style={inp} value={s[k]} onChange={e=>set(k,e.target.value)} placeholder={ph} />
+            </div>
+          ))}
+          <div>
+            <label style={{ fontSize:12, color:T.textMuted, fontWeight:600, display:"block", marginBottom:4 }}>出發時間</label>
+            <input style={inp} type="time" value={s.startTime} onChange={e=>set("startTime",e.target.value)} />
+          </div>
+          <div>
+            <label style={{ fontSize:12, color:T.textMuted, fontWeight:600, display:"block", marginBottom:4 }}>結束時間</label>
+            <input style={inp} type="time" value={s.endTime} onChange={e=>set("endTime",e.target.value)} />
+          </div>
+          <div>
+            <label style={{ fontSize:12, color:T.textMuted, fontWeight:600, display:"block", marginBottom:4 }}>預設每次看診時間（分鐘）</label>
+            <input style={inp} type="number" min="10" max="120" value={s.visitMins} onChange={e=>set("visitMins",parseInt(e.target.value)||25)} />
+          </div>
+        </div>
+        <button onClick={()=>onSave(s)} style={{ marginTop:14, background:T.primaryLight, color:"#fff", border:"none", borderRadius:9, padding:"10px 20px", fontSize:14, fontWeight:700, cursor:"pointer" }}>💾 儲存設定</button>
+      </div>
+
+      {/* 狀態摘要 */}
+      <div style={{ background:T.card, borderRadius:16, padding:20, boxShadow:"0 2px 16px rgba(0,0,0,0.08)", marginBottom:14 }}>
+        <h2 style={{ fontSize:16, color:T.primary, marginBottom:14, display:"flex", alignItems:"center", gap:8 }}><span>📊</span> 本週排班摘要</h2>
+        <div style={{ display:"grid", gridTemplateColumns:"repeat(5,1fr)", gap:8, marginBottom:14 }}>
+          {DAY_KEYS.map((dk,i)=>{
+            const count = patients.filter(p=>{ const sd=scheduleData[p.id]; return sd&&sd[dk]?.enabled; }).length;
+            return (
+              <div key={dk} style={{ background: count>0?"#E3F2FD":"#F5F5F5", borderRadius:10, padding:"10px 0", textAlign:"center", border:`1px solid ${count>0?T.border:"#E0E0E0"}` }}>
+                <div style={{ fontSize:11, color:T.textMuted }}>{DAYS[i]}</div>
+                <div style={{ fontSize:22, fontWeight:700, color:count>0?T.primary:"#BDBDBD" }}>{count}</div>
+                <div style={{ fontSize:10, color:T.textMuted }}>位</div>
+              </div>
+            );
+          })}
+        </div>
+        <div style={{ fontSize:13, color:T.textMuted, marginBottom:16 }}>
+          共 <strong style={{ color:T.primary }}>{scheduledCount}</strong> 位患者已設定可看診時間
+          （共 {patients.length} 位在案）
+        </div>
+        <button onClick={onPlan} disabled={planning || scheduledCount===0} style={{
+          width:"100%", padding:14, borderRadius:12,
+          background: planning||scheduledCount===0?"#BDBDBD":`linear-gradient(135deg,${T.primaryDark},${T.primary})`,
+          color:"#fff", border:"none", fontSize:16, fontWeight:700,
+          cursor: planning||scheduledCount===0?"not-allowed":"pointer",
+          boxShadow: planning?"none":"0 4px 16px rgba(21,101,192,0.35)",
+        }}>{planning ? "🔄 規劃中..." : "🚗 開始規劃本週路線"}</button>
+      </div>
+    </div>
+  );
+}
+
+// ════════════════════════════════════════════════════════════
+// 排班設定頁
+// ════════════════════════════════════════════════════════════
+function ScheduleView({ patients, scheduleData, onSave, defaultVisitMins }) {
+  const [search, setSearch] = useState("");
+  const [editing, setEditing] = useState(null); // patient id
+
+  const filtered = patients.filter(p =>
+    !search || (p.name||"").includes(search) || (p.chartNo||"").includes(search)
+  );
+
+  return (
+    <div style={{ animation:"fadeIn .3s ease" }}>
+      <div style={{ background:T.card, borderRadius:14, padding:"14px 16px", marginBottom:12, boxShadow:"0 1px 8px rgba(0,0,0,0.07)" }}>
+        <div style={{ fontSize:13, color:T.textMuted, lineHeight:1.7 }}>
+          為每位患者設定「可看診的星期」和「時間窗口」。點擊患者名稱展開設定。
+        </div>
+      </div>
+
+      <div style={{ position:"relative", marginBottom:10 }}>
+        <span style={{ position:"absolute", left:12, top:"50%", transform:"translateY(-50%)", fontSize:14, color:T.textMuted }}>🔍</span>
+        <input value={search} onChange={e=>setSearch(e.target.value)} placeholder="搜尋患者姓名、病歷號..."
+          style={{ width:"100%", padding:"10px 12px 10px 34px", borderRadius:10, border:`1.5px solid ${T.border}`, fontSize:14, background:"#fff" }} />
+      </div>
+
+      {filtered.map(p => (
+        <PatientScheduleCard key={p.id} p={p}
+          schedule={scheduleData[p.id] || {}}
+          isEditing={editing===p.id}
+          onToggle={()=>setEditing(editing===p.id?null:p.id)}
+          onSave={data=>{ onSave(p.id,data); setEditing(null); }}
+          defaultVisitMins={defaultVisitMins} />
+      ))}
+    </div>
+  );
+}
+
+function PatientScheduleCard({ p, schedule, isEditing, onToggle, onSave, defaultVisitMins }) {
+  const [s, setS] = useState(() => ({
+    windowStart: schedule.windowStart || "09:00",
+    windowEnd:   schedule.windowEnd   || "17:00",
+    visitMins:   schedule.visitMins   || defaultVisitMins,
+    mon: schedule.mon || { enabled:false },
+    tue: schedule.tue || { enabled:false },
+    wed: schedule.wed || { enabled:false },
+    thu: schedule.thu || { enabled:false },
+    fri: schedule.fri || { enabled:false },
+  }));
+
+  const enabledDays = DAY_KEYS.filter(dk=>s[dk]?.enabled);
+  const inp = { padding:"8px 10px", borderRadius:7, border:`1.5px solid ${T.border}`, fontSize:13, background:"#fff" };
+
+  return (
+    <div style={{ background:T.card, borderRadius:12, marginBottom:8, boxShadow:"0 1px 8px rgba(0,0,0,0.06)", overflow:"hidden" }}>
+      <div onClick={onToggle} style={{ padding:"12px 16px", cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"space-between" }}>
+        <div>
+          <span style={{ fontSize:15, fontWeight:700, color:T.text }}>{p.name}</span>
+          {p.chartNo && <span style={{ fontSize:12, color:T.textMuted, marginLeft:8 }}>#{p.chartNo}</span>}
+          {p.diagnosis && <span style={{ fontSize:11, color:T.textMuted, marginLeft:8 }}>🩺 {p.diagnosis}</span>}
+        </div>
+        <div style={{ display:"flex", alignItems:"center", gap:8 }}>
+          {enabledDays.length > 0 ? (
+            <div style={{ display:"flex", gap:4 }}>
+              {enabledDays.map(dk=>(<span key={dk} style={{ background:T.primary, color:"#fff", fontSize:10, fontWeight:700, padding:"2px 7px", borderRadius:8 }}>{DAYS[DAY_KEYS.indexOf(dk)]}</span>))}
+            </div>
+          ) : (
+            <span style={{ fontSize:11, color:"#BDBDBD" }}>未設定</span>
+          )}
+          <span style={{ color:T.textMuted, fontSize:14 }}>{isEditing?"▲":"▼"}</span>
+        </div>
+      </div>
+
+      {isEditing && (
+        <div style={{ padding:"0 16px 16px", borderTop:`1px solid ${T.border}` }}>
+          <div style={{ paddingTop:12, display:"flex", gap:8, marginBottom:12, flexWrap:"wrap" }}>
+            {DAY_KEYS.map((dk,i)=>(
+              <button key={dk} onClick={()=>setS(prev=>({...prev,[dk]:{...prev[dk],enabled:!prev[dk]?.enabled}}))}
+                className={`day-tab ${s[dk]?.enabled?"active":"inactive"}`}>
+                {DAYS[i]}
+              </button>
+            ))}
+          </div>
+          <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:10, marginBottom:14 }}>
+            <div>
+              <label style={{ fontSize:11, color:T.textMuted, display:"block", marginBottom:4, fontWeight:600 }}>可看診開始時間</label>
+              <input style={inp} type="time" value={s.windowStart} onChange={e=>setS(p=>({...p,windowStart:e.target.value}))} />
+            </div>
+            <div>
+              <label style={{ fontSize:11, color:T.textMuted, display:"block", marginBottom:4, fontWeight:600 }}>可看診結束時間</label>
+              <input style={inp} type="time" value={s.windowEnd} onChange={e=>setS(p=>({...p,windowEnd:e.target.value}))} />
+            </div>
+            <div>
+              <label style={{ fontSize:11, color:T.textMuted, display:"block", marginBottom:4, fontWeight:600 }}>看診時間（分鐘）</label>
+              <input style={inp} type="number" min="10" max="120" value={s.visitMins} onChange={e=>setS(p=>({...p,visitMins:parseInt(e.target.value)||defaultVisitMins}))} />
+            </div>
+          </div>
+          {p.address ? (
+            <div style={{ fontSize:12, color:T.textMuted, marginBottom:10 }}>📍 {p.address}</div>
+          ) : (
+            <div style={{ fontSize:12, color:T.danger, marginBottom:10 }}>⚠️ 此患者未填寫地址，無法加入路線規劃</div>
+          )}
+          <button onClick={()=>onSave(s)} style={{ background:`linear-gradient(135deg,${T.primaryDark},${T.primary})`, color:"#fff", border:"none", borderRadius:8, padding:"9px 20px", fontSize:13, fontWeight:700, cursor:"pointer" }}>✅ 儲存</button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ════════════════════════════════════════════════════════════
+// 結果頁
+// ════════════════════════════════════════════════════════════
+function ResultView({ result, settings, activeDay, setActiveDay, getMapsUrl }) {
+  const dayResult = result[activeDay] || { route:[], unscheduled:[] };
+  const totalUnscheduled = DAY_KEYS.reduce((acc,dk)=>acc+(result[dk]?.unscheduled?.length||0),0);
+
+  return (
+    <div style={{ animation:"fadeIn .3s ease" }}>
+      {/* 星期選擇 */}
+      <div style={{ display:"flex", gap:8, marginBottom:14, overflowX:"auto", paddingBottom:4 }}>
+        {DAY_KEYS.map((dk,i)=>{
+          const r = result[dk] || { route:[], unscheduled:[] };
+          return (
+            <button key={dk} onClick={()=>setActiveDay(dk)}
+              className={`day-tab ${activeDay===dk?"active":"inactive"}`}
+              style={{ flexShrink:0 }}>
+              {DAYS[i]} ({r.route.length})
+            </button>
+          );
+        })}
+      </div>
+
+      {/* 當天路線 */}
+      <div style={{ background:T.card, borderRadius:16, padding:18, boxShadow:"0 2px 12px rgba(0,0,0,0.08)", marginBottom:12 }}>
+        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:14 }}>
+          <h2 style={{ fontSize:16, color:T.primary }}>
+            {DAYS[DAY_KEYS.indexOf(activeDay)]} 路線
+            <span style={{ fontSize:13, fontWeight:400, color:T.textMuted, marginLeft:8 }}>共 {dayResult.route.length} 位</span>
+          </h2>
+          {dayResult.route.length > 0 && (
+            <a href={getMapsUrl(activeDay)} target="_blank" rel="noreferrer"
+              style={{ background:"#34A853", color:"#fff", textDecoration:"none", borderRadius:8, padding:"7px 14px", fontSize:12, fontWeight:700 }}>
+              🗺️ Google Maps 導航
+            </a>
+          )}
+        </div>
+
+        {dayResult.route.length === 0 ? (
+          <div style={{ textAlign:"center", padding:"30px 0", color:T.textMuted }}>
+            <div style={{ fontSize:32, marginBottom:8 }}>📭</div>
+            <div style={{ fontSize:14 }}>今日無排程</div>
+          </div>
+        ) : (
+          <>
+            {/* 出發點 */}
+            <TimelineItem icon="🏠" label="出發地點" address={settings.startAddress} time={settings.startTime} isStart />
+
+            {dayResult.route.map((stop, i) => (
+              <TimelineItem key={stop.patient.id} icon={`${i+1}`} isNum
+                label={stop.patient.name}
+                sub={[stop.patient.chartNo && `#${stop.patient.chartNo}`, stop.patient.diagnosis].filter(Boolean).join(" ｜ ")}
+                address={stop.patient.address}
+                travel={stop.travel}
+                arrival={minsToTime(stop.arrival)}
+                start={minsToTime(stop.start)}
+                finish={minsToTime(stop.finish)}
+                visitMins={stop.finish - stop.start}
+                wait={stop.start - stop.arrival}
+              />
+            ))}
+
+            {/* 結束點 */}
+            <TimelineItem icon="🏁" label="結束地點" address={settings.endAddress||settings.startAddress}
+              time={minsToTime(dayResult.route[dayResult.route.length-1].finish + 5)} isEnd />
+          </>
+        )}
+      </div>
+
+      {/* 排不進去的患者 */}
+      {dayResult.unscheduled.length > 0 && (
+        <div style={{ background:"#FFF3E0", borderRadius:14, padding:16, boxShadow:"0 1px 8px rgba(0,0,0,0.06)", marginBottom:12, border:`1px solid #FFB74D` }}>
+          <h3 style={{ fontSize:14, color:T.warning, marginBottom:10 }}>⚠️ {DAYS[DAY_KEYS.indexOf(activeDay)]}排不進去的患者</h3>
+          {dayResult.unscheduled.map(({patient:p, reason},i)=>(
+            <div key={i} style={{ fontSize:13, color:T.text, padding:"5px 0", borderBottom:`1px solid #FFE0B2`, display:"flex", justifyContent:"space-between" }}>
+              <span><strong>{p.name}</strong>{p.chartNo&&` (#${p.chartNo})`}</span>
+              <span style={{ color:T.warning, fontSize:12 }}>{reason}</span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* 本週總計 */}
+      <div style={{ background:T.card, borderRadius:14, padding:16, boxShadow:"0 1px 8px rgba(0,0,0,0.06)" }}>
+        <h3 style={{ fontSize:14, color:T.primary, marginBottom:10 }}>📊 本週總計</h3>
+        <div style={{ display:"grid", gridTemplateColumns:"repeat(5,1fr)", gap:8, marginBottom: totalUnscheduled>0?10:0 }}>
+          {DAY_KEYS.map((dk,i)=>{
+            const r=result[dk]||{route:[],unscheduled:[]};
+            return (
+              <div key={dk} onClick={()=>setActiveDay(dk)} style={{ background:activeDay===dk?"#E3F2FD":"#F8F9FA", borderRadius:9, padding:"8px 4px", textAlign:"center", cursor:"pointer", border:`1.5px solid ${activeDay===dk?T.primary:T.border}` }}>
+                <div style={{ fontSize:11, color:T.textMuted }}>{DAYS[i]}</div>
+                <div style={{ fontSize:20, fontWeight:700, color:T.primary }}>{r.route.length}</div>
+                {r.unscheduled.length>0&&<div style={{ fontSize:10, color:T.warning }}>+{r.unscheduled.length}未排</div>}
+              </div>
+            );
+          })}
+        </div>
+        {totalUnscheduled > 0 && (
+          <div style={{ fontSize:12, color:T.warning, padding:"8px 12px", background:"#FFF8E1", borderRadius:8 }}>
+            ⚠️ 本週共有 {totalUnscheduled} 位患者未能排入，請查看各天詳情
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function TimelineItem({ icon, isNum, label, sub, address, travel, arrival, start, finish, visitMins, wait, time, isStart, isEnd }) {
+  return (
+    <div style={{ display:"flex", gap:12, marginBottom:12, position:"relative" }}>
+      {/* 圖示 */}
+      <div style={{ flexShrink:0, display:"flex", flexDirection:"column", alignItems:"center" }}>
+        <div style={{
+          width:32, height:32, borderRadius:"50%",
+          background: isStart||isEnd?"#E8F5E9" : `linear-gradient(135deg,${T.primaryDark},${T.primary})`,
+          color: isStart||isEnd?T.success:"#fff",
+          display:"flex", alignItems:"center", justifyContent:"center",
+          fontSize: isNum?13:16, fontWeight:700,
+          boxShadow:"0 2px 8px rgba(0,0,0,0.12)",
+        }}>{icon}</div>
+        {!isEnd && <div style={{ width:2, flex:1, background:T.border, marginTop:4, minHeight:20 }} />}
+      </div>
+      {/* 內容 */}
+      <div style={{ flex:1, paddingBottom:8 }}>
+        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start" }}>
+          <div>
+            <div style={{ fontSize:14, fontWeight:700, color: isStart||isEnd?T.success:T.text }}>{label}</div>
+            {sub && <div style={{ fontSize:11, color:T.textMuted, marginTop:1 }}>{sub}</div>}
+            {address && <div style={{ fontSize:11, color:T.textMuted, marginTop:2 }}>📍 {address}</div>}
+          </div>
+          <div style={{ textAlign:"right", flexShrink:0 }}>
+            {time && <div style={{ fontSize:13, fontWeight:700, color:T.primary }}>{time}</div>}
+            {start && <div style={{ fontSize:13, fontWeight:700, color:T.primary }}>{start} – {finish}</div>}
+            {visitMins && <div style={{ fontSize:11, color:T.textMuted }}>看診 {visitMins} 分鐘</div>}
+          </div>
+        </div>
+        {travel > 0 && (
+          <div style={{ fontSize:11, color:T.textMuted, marginTop:4, display:"flex", gap:8 }}>
+            <span>🚗 車程約 {travel} 分鐘</span>
+            {wait > 0 && <span>⏳ 等候 {wait} 分鐘</span>}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
