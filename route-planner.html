@@ -624,4 +624,14 @@ function TimelineItem({ icon, isNum, label, sub, address, travel, arrival, start
             {visitMins&&<div style={{fontSize:11,color:T.textMuted}}>看診 {visitMins} 分</div>}
           </div>
         </div>
-        {travel>0&&<div style={{fontSize:11,color:T.textMuted,marginTop:3,
+        {travel>0&&<div style={{fontSize:11,color:T.textMuted,marginTop:3,display:"flex",gap:8}}>
+          <span>🚗 車程約 {travel} 分</span>
+          {wait>0&&<span>⏳ 等候 {wait} 分</span>}
+        </div>}
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script></body></html>
