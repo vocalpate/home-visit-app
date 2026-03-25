@@ -69,13 +69,16 @@ function planDay(dayKey, patients, coords, startCoord, endCoord, cfg) {
   const startM=timeToMins(cfg.startTime), endM=timeToMins(cfg.endTime);
   const available = patients.filter(p=>{
     const s=p.schedule||{};
-    return s[dayKey]?.enabled && s.windowStart && s.windowEnd && coords[p.id];
+    const dd=s[dayKey];
+    if (!dd) return false;
+    if (!coords[p.id]) return false;
+    // 新格式：slots陣列；舊格式：enabled+windowStart/End
+    return (dd.slots?.length>0) || (dd.enabled && s.windowStart);
   });
   if (!available.length) return { route:[], unscheduled:[] };
 
   let curCoord=startCoord, curTime=startM;
-  const route=[], remaining=[...available];
-  const unscheduled=[];
+  const route=[], remaining=[...available], unscheduled=[];
 
   while (remaining.length>0) {
     let best=null, bestIdx=-1, bestFinish=Infinity;
@@ -84,14 +87,23 @@ function planDay(dayKey, patients, coords, startCoord, endCoord, cfg) {
       const travel=travelMins(curCoord,coord);
       const arrival=curTime+travel;
       const s=p.schedule;
-      const winStart=timeToMins(s.windowStart), winEnd=timeToMins(s.windowEnd);
-      const visit=s.visitMins||cfg.visitMins;
-      const start=Math.max(arrival,winStart);
-      const finish=start+visit;
-      const toEnd=endCoord?travelMins(coord,endCoord):0;
-      if (finish+toEnd<=endM && finish<=winEnd && finish<bestFinish) {
-        best={...p,_arrival:arrival,_start:start,_finish:finish,_travel:travel};
-        bestIdx=i; bestFinish=finish;
+      const dd=s[dayKey];
+      // 支援新格式（slots）和舊格式
+      const slots=dd?.slots?.length>0
+        ? dd.slots
+        : [{start:s.windowStart||"09:00", end:s.windowEnd||"17:00", visitMins:s.visitMins||cfg.visitMins}];
+      // 找最早能安排的時段
+      for (const slot of slots) {
+        const winStart=timeToMins(slot.start), winEnd=timeToMins(slot.end);
+        const visit=slot.visitMins||cfg.visitMins;
+        const start=Math.max(arrival,winStart);
+        const finish=start+visit;
+        const toEnd=endCoord?travelMins(coord,endCoord):0;
+        if (finish+toEnd<=endM && finish<=winEnd && finish<bestFinish) {
+          best={...p,_arrival:arrival,_start:start,_finish:finish,_travel:travel};
+          bestIdx=i; bestFinish=finish;
+          break; // 找到最早時段即可
+        }
       }
     });
     if (!best) { remaining.forEach(p=>unscheduled.push({patient:p,reason:"時間窗口或行程時間不足"})); break; }
@@ -471,79 +483,186 @@ function ScheduleView({ doctor, docColor, patients, scheduleData, onSave, defaul
   );
 }
 
+// 完整七天
+const ALL_DAY_KEYS  = ["mon","tue","wed","thu","fri","sat","sun"];
+const ALL_DAY_NAMES = ["週一","週二","週三","週四","週五","週六","週日"];
+
 function PatientScheduleCard({ p, docColor, schedule, isEditing, onToggle, onSave, onSaveAddress, defaultVisitMins }) {
-  const [s, setS] = useState(()=>({
-    windowStart: schedule.windowStart||"09:00",
-    windowEnd:   schedule.windowEnd||"17:00",
-    visitMins:   schedule.visitMins||defaultVisitMins,
-    mon: schedule.mon||{enabled:false}, tue: schedule.tue||{enabled:false},
-    wed: schedule.wed||{enabled:false}, thu: schedule.thu||{enabled:false},
-    fri: schedule.fri||{enabled:false},
-  }));
+  // days: { mon: [ {start,end,visitMins}, ... ], ... }
+  const initDays = () => {
+    const d = {};
+    ALL_DAY_KEYS.forEach(dk => {
+      if (schedule[dk]?.slots) {
+        d[dk] = schedule[dk].slots;
+      } else if (schedule[dk]?.enabled) {
+        // 舊格式轉換
+        d[dk] = [{ start: schedule.windowStart||"09:00", end: schedule.windowEnd||"17:00", visitMins: schedule.visitMins||defaultVisitMins }];
+      } else {
+        d[dk] = [];
+      }
+    });
+    return d;
+  };
+
+  const [days, setDays]       = useState(initDays);
   const [address, setAddress] = useState(p.address||"");
-  const [addrSaved, setAddrSaved] = useState(false);
-  const enabledDays = DAY_KEYS.filter(dk=>s[dk]?.enabled);
-  const inp={padding:"8px 10px",borderRadius:7,border:`1.5px solid ${T.border}`,fontSize:13,background:"#fff"};
+  const inp = { padding:"8px 10px", borderRadius:7, border:`1.5px solid ${T.border}`, fontSize:13, background:"#fff" };
+
+  const enabledDays = ALL_DAY_KEYS.filter(dk => days[dk]?.length > 0);
+  const allSelected = ALL_DAY_KEYS.every(dk => days[dk]?.length > 0);
+
+  // 全選 / 全不選
+  const toggleAll = () => {
+    if (allSelected) {
+      const d = {}; ALL_DAY_KEYS.forEach(dk => d[dk] = []); setDays(d);
+    } else {
+      const d = {};
+      ALL_DAY_KEYS.forEach(dk => {
+        d[dk] = days[dk]?.length > 0 ? days[dk] : [{ start:"09:00", end:"17:00", visitMins:defaultVisitMins }];
+      });
+      setDays(d);
+    }
+  };
+
+  // 切換某天
+  const toggleDay = dk => {
+    setDays(prev => ({
+      ...prev,
+      [dk]: prev[dk]?.length > 0 ? [] : [{ start:"09:00", end:"17:00", visitMins:defaultVisitMins }]
+    }));
+  };
+
+  // 新增時段
+  const addSlot = dk => {
+    setDays(prev => ({ ...prev, [dk]: [...(prev[dk]||[]), { start:"09:00", end:"17:00", visitMins:defaultVisitMins }] }));
+  };
+
+  // 刪除時段
+  const removeSlot = (dk, idx) => {
+    setDays(prev => { const s=[...prev[dk]]; s.splice(idx,1); return {...prev,[dk]:s}; });
+  };
+
+  // 更新時段欄位
+  const updateSlot = (dk, idx, field, val) => {
+    setDays(prev => {
+      const s = prev[dk].map((slot,i) => i===idx ? {...slot,[field]:val} : slot);
+      return {...prev,[dk]:s};
+    });
+  };
 
   const handleSave = () => {
-    // 若地址有變動，同步更新個案資料
     if (address.trim() !== (p.address||"").trim()) {
       onSaveAddress(address.trim());
-      p.address = address.trim(); // 更新本地參考
+      p.address = address.trim();
     }
-    onSave(s);
+    // 轉換格式供路線規劃使用
+    const out = {};
+    ALL_DAY_KEYS.forEach(dk => {
+      out[dk] = { enabled: days[dk]?.length>0, slots: days[dk]||[] };
+      // 相容舊格式（取第一個時段作為代表）
+      if (days[dk]?.length > 0) {
+        out.windowStart = days[dk][0].start;
+        out.windowEnd   = days[dk][0].end;
+        out.visitMins   = days[dk][0].visitMins;
+      }
+    });
+    onSave(out);
   };
 
   return (
     <div style={{background:T.card,borderRadius:12,marginBottom:8,boxShadow:"0 1px 8px rgba(0,0,0,0.06)",overflow:"hidden"}}>
+      {/* 標題列 */}
       <div onClick={onToggle} style={{padding:"12px 14px",cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"space-between"}}>
-        <div>
+        <div style={{minWidth:0,flex:1}}>
           <span style={{fontSize:14,fontWeight:700,color:T.text}}>{p.name}</span>
           {p.chartNo&&<span style={{fontSize:12,color:T.textMuted,marginLeft:8}}>#{p.chartNo}</span>}
-          {p.diagnosis&&<span style={{fontSize:11,color:T.textMuted,marginLeft:8}}>🩺{p.diagnosis}</span>}
+          {p.diagnosis&&<span style={{fontSize:11,color:T.textMuted,marginLeft:6}}>🩺{p.diagnosis}</span>}
+          {enabledDays.length>0&&(
+            <div style={{marginTop:3,display:"flex",gap:3,flexWrap:"wrap"}}>
+              {enabledDays.map(dk=>(
+                <span key={dk} style={{background:docColor,color:"#fff",fontSize:10,fontWeight:700,padding:"1px 7px",borderRadius:8}}>
+                  {ALL_DAY_NAMES[ALL_DAY_KEYS.indexOf(dk)]} {days[dk].length>1?`×${days[dk].length}`:""}
+                </span>
+              ))}
+            </div>
+          )}
         </div>
-        <div style={{display:"flex",alignItems:"center",gap:6}}>
-          {enabledDays.length>0
-            ?<div style={{display:"flex",gap:3}}>{enabledDays.map(dk=><span key={dk} style={{background:docColor,color:"#fff",fontSize:10,fontWeight:700,padding:"2px 7px",borderRadius:8}}>{DAYS[DAY_KEYS.indexOf(dk)]}</span>)}</div>
-            :<span style={{fontSize:11,color:"#BDBDBD"}}>未設定</span>}
+        <div style={{display:"flex",alignItems:"center",gap:6,flexShrink:0,marginLeft:8}}>
+          {enabledDays.length===0&&<span style={{fontSize:11,color:"#BDBDBD"}}>未設定</span>}
           <span style={{color:T.textMuted,fontSize:13}}>{isEditing?"▲":"▼"}</span>
         </div>
       </div>
+
+      {/* 展開內容 */}
       {isEditing&&(
-        <div style={{padding:"0 14px 14px",borderTop:`1px solid ${T.border}`}}>
-          <div style={{paddingTop:10,display:"flex",gap:7,marginBottom:12,flexWrap:"wrap"}}>
-            {DAY_KEYS.map((dk,i)=>(
-              <button key={dk} onClick={()=>setS(prev=>({...prev,[dk]:{...prev[dk],enabled:!prev[dk]?.enabled}}))}
-                className={`day-tab ${s[dk]?.enabled?"active":"inactive"}`}
-                style={s[dk]?.enabled?{background:docColor}:{}}>
-                {DAYS[i]}
-              </button>
-            ))}
-          </div>
-          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:10,marginBottom:12}}>
-            <div><label style={{fontSize:11,color:T.textMuted,display:"block",marginBottom:3,fontWeight:600}}>開始時間</label><input style={inp} type="time" value={s.windowStart} onChange={e=>setS(p=>({...p,windowStart:e.target.value}))}/></div>
-            <div><label style={{fontSize:11,color:T.textMuted,display:"block",marginBottom:3,fontWeight:600}}>結束時間</label><input style={inp} type="time" value={s.windowEnd} onChange={e=>setS(p=>({...p,windowEnd:e.target.value}))}/></div>
-            <div><label style={{fontSize:11,color:T.textMuted,display:"block",marginBottom:3,fontWeight:600}}>看診分鐘</label><input style={inp} type="number" min="10" max="120" value={s.visitMins} onChange={e=>setS(p=>({...p,visitMins:parseInt(e.target.value)||defaultVisitMins}))}/></div>
+        <div style={{padding:"0 14px 16px",borderTop:`1px solid ${T.border}`}}>
+
+          {/* 星期選擇列 + 全選 */}
+          <div style={{paddingTop:12,marginBottom:14}}>
+            <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:8,flexWrap:"wrap"}}>
+              <button onClick={toggleAll} style={{
+                padding:"5px 12px",borderRadius:16,border:"none",cursor:"pointer",fontSize:12,fontWeight:700,
+                background: allSelected?docColor:"#F5F5F5",
+                color: allSelected?"#fff":T.textMuted,
+              }}>{allSelected?"✓ 全選":"全選"}</button>
+              {ALL_DAY_KEYS.map((dk,i)=>{
+                const on = days[dk]?.length>0;
+                return (
+                  <button key={dk} onClick={()=>toggleDay(dk)} style={{
+                    padding:"5px 12px",borderRadius:16,border:`1.5px solid ${on?docColor:T.border}`,cursor:"pointer",fontSize:12,fontWeight:600,
+                    background: on?docColor:"#fff",
+                    color: on?"#fff":T.textMuted,
+                  }}>{ALL_DAY_NAMES[i]}{on&&days[dk].length>1?` ×${days[dk].length}`:""}</button>
+                );
+              })}
+            </div>
           </div>
 
-          {/* 地址欄位：自動帶入，可修改並同步回個案資料 */}
-          <div style={{marginBottom:12}}>
+          {/* 各天時段設定 */}
+          {ALL_DAY_KEYS.map((dk,di)=> days[dk]?.length>0 && (
+            <div key={dk} style={{background:"#F8F9FF",borderRadius:10,padding:"10px 12px",marginBottom:10,border:`1px solid ${T.border}`}}>
+              <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:8}}>
+                <span style={{fontSize:13,fontWeight:700,color:docColor}}>{ALL_DAY_NAMES[di]}</span>
+                <button onClick={()=>addSlot(dk)} style={{background:docColor,color:"#fff",border:"none",borderRadius:8,padding:"3px 10px",fontSize:11,cursor:"pointer",fontWeight:700}}>＋ 新增時段</button>
+              </div>
+              {days[dk].map((slot,si)=>(
+                <div key={si} style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr auto",gap:8,marginBottom:si<days[dk].length-1?8:0,alignItems:"end"}}>
+                  <div>
+                    <label style={{fontSize:10,color:T.textMuted,display:"block",marginBottom:2,fontWeight:600}}>開始時間</label>
+                    <input style={inp} type="time" value={slot.start} onChange={e=>updateSlot(dk,si,"start",e.target.value)}/>
+                  </div>
+                  <div>
+                    <label style={{fontSize:10,color:T.textMuted,display:"block",marginBottom:2,fontWeight:600}}>結束時間</label>
+                    <input style={inp} type="time" value={slot.end} onChange={e=>updateSlot(dk,si,"end",e.target.value)}/>
+                  </div>
+                  <div>
+                    <label style={{fontSize:10,color:T.textMuted,display:"block",marginBottom:2,fontWeight:600}}>看診分鐘</label>
+                    <input style={inp} type="number" min="10" max="120" value={slot.visitMins} onChange={e=>updateSlot(dk,si,"visitMins",parseInt(e.target.value)||defaultVisitMins)}/>
+                  </div>
+                  <button onClick={()=>removeSlot(dk,si)} style={{padding:"8px 10px",borderRadius:7,border:`1px solid ${T.border}`,background:"#fff",color:T.danger,cursor:"pointer",fontSize:13,marginBottom:1}}>✕</button>
+                </div>
+              ))}
+            </div>
+          ))}
+
+          {enabledDays.length===0&&(
+            <div style={{textAlign:"center",padding:"12px 0",color:T.textMuted,fontSize:13}}>請選擇可訪視的星期</div>
+          )}
+
+          {/* 地址欄位 */}
+          <div style={{marginTop:12,marginBottom:12}}>
             <label style={{fontSize:11,color:T.textMuted,display:"block",marginBottom:4,fontWeight:600}}>
               患者地址
-              {!p.address && <span style={{color:T.danger,marginLeft:6}}>（個案資料未填，請在此補充）</span>}
-              {p.address && address===p.address && <span style={{color:T.success,marginLeft:6}}>✅ 已從個案資料帶入</span>}
-              {p.address && address!==p.address && address && <span style={{color:T.warning,marginLeft:6}}>⚠️ 儲存後將同步更新個案資料</span>}
+              {!p.address&&<span style={{color:T.danger,marginLeft:6}}>（個案資料未填，請補充）</span>}
+              {p.address&&address===p.address&&<span style={{color:T.success,marginLeft:6}}>✅ 已從個案資料帶入</span>}
+              {p.address&&address!==p.address&&address&&<span style={{color:T.warning,marginLeft:6}}>⚠️ 儲存後將同步更新個案資料</span>}
             </label>
-            <input
-              style={{...inp, width:"100%", background: address?"#fff":"#FFF8E1", border:`1.5px solid ${address?T.border:T.warning}`}}
-              value={address}
-              onChange={e=>setAddress(e.target.value)}
-              placeholder="請填入完整地址，例：高雄市○○區○○路123號"
-            />
-            {!address && <div style={{fontSize:11,color:T.danger,marginTop:4}}>⚠️ 未填地址，此患者無法加入路線規劃</div>}
+            <input style={{...inp,width:"100%",background:address?"#fff":"#FFF8E1",border:`1.5px solid ${address?T.border:T.warning}`}}
+              value={address} onChange={e=>setAddress(e.target.value)} placeholder="高雄市○○區○○路123號"/>
+            {!address&&<div style={{fontSize:11,color:T.danger,marginTop:3}}>⚠️ 未填地址，此患者無法加入路線規劃</div>}
           </div>
 
-          <button onClick={handleSave} style={{background:`linear-gradient(135deg,${T.primaryDark},${T.primary})`,color:"#fff",border:"none",borderRadius:8,padding:"8px 18px",fontSize:13,fontWeight:700,cursor:"pointer"}}>✅ 儲存</button>
+          <button onClick={handleSave} style={{background:`linear-gradient(135deg,${T.primaryDark},${T.primary})`,color:"#fff",border:"none",borderRadius:8,padding:"9px 20px",fontSize:13,fontWeight:700,cursor:"pointer"}}>✅ 儲存</button>
         </div>
       )}
     </div>
@@ -596,78 +715,4 @@ function ResultView({ result, doctor, docColor, activeDay, setActiveDay, getMaps
             {dayResult.route.map((stop,i)=>(
               <TimelineItem key={stop.patient.id} icon={`${i+1}`} isNum color={docColor}
                 label={stop.patient.name}
-                sub={[stop.patient.chartNo&&`#${stop.patient.chartNo}`,stop.patient.diagnosis].filter(Boolean).join(" ｜ ")}
-                address={stop.patient.address}
-                travel={stop.travel} arrival={minsToTime(stop.arrival)}
-                start={minsToTime(stop.start)} finish={minsToTime(stop.finish)}
-                visitMins={stop.finish-stop.start} wait={stop.start-stop.arrival}/>
-            ))}
-            <TimelineItem icon="🏁" label="結束地點" address={dayResult.daySettings?.endAddress||dayResult.daySettings?.startAddress||""} time={minsToTime(dayResult.route[dayResult.route.length-1].finish+5)} isEnd color={docColor}/>
-          </>
-        )}
-      </div>
-
-      {/* 排不進去 */}
-      {dayResult.unscheduled?.length>0&&(
-        <div style={{background:"#FFF3E0",borderRadius:12,padding:14,marginBottom:12,border:"1px solid #FFB74D"}}>
-          <h3 style={{fontSize:13,color:T.warning,marginBottom:8}}>⚠️ {DAYS[DAY_KEYS.indexOf(activeDay)]}排不進去的患者</h3>
-          {dayResult.unscheduled.map(({patient:p,reason},i)=>(
-            <div key={i} style={{fontSize:13,padding:"4px 0",borderBottom:"1px solid #FFE0B2",display:"flex",justifyContent:"space-between"}}>
-              <span><strong>{p.name}</strong>{p.chartNo&&` (#${p.chartNo})`}</span>
-              <span style={{fontSize:12,color:T.warning}}>{reason}</span>
-            </div>
-          ))}
-        </div>
-      )}
-
-      {/* 本週總計 */}
-      <div style={{background:T.card,borderRadius:12,padding:14}}>
-        <h3 style={{fontSize:13,color:T.primary,marginBottom:10}}>📊 本週總計（{doctor}）</h3>
-        <div style={{display:"grid",gridTemplateColumns:"repeat(5,1fr)",gap:7,marginBottom:totalUnscheduled>0?10:0}}>
-          {DAY_KEYS.map((dk,i)=>{
-            const r=result[dk]||{route:[],unscheduled:[]};
-            return <div key={dk} onClick={()=>setActiveDay(dk)} style={{background:activeDay===dk?"#E3F2FD":r.skipped?"#F5F5F5":"#FAFAFA",borderRadius:9,padding:"8px 4px",textAlign:"center",cursor:"pointer",border:`1.5px solid ${activeDay===dk?docColor:"#E0E0E0"}`}}>
-              <div style={{fontSize:11,color:T.textMuted}}>{DAYS[i]}</div>
-              <div style={{fontSize:18,fontWeight:700,color:r.skipped?"#BDBDBD":docColor}}>{r.skipped?"—":r.route.length}</div>
-              {r.unscheduled?.length>0&&<div style={{fontSize:10,color:T.warning}}>+{r.unscheduled.length}未排</div>}
-            </div>;
-          })}
-        </div>
-        {totalUnscheduled>0&&<div style={{fontSize:12,color:T.warning,padding:"7px 10px",background:"#FFF8E1",borderRadius:7}}>⚠️ 本週共 {totalUnscheduled} 位患者未能排入</div>}
-      </div>
-    </div>
-  );
-}
-
-function TimelineItem({ icon, isNum, label, sub, address, travel, arrival, start, finish, visitMins, wait, time, isStart, isEnd, color }) {
-  const c = color||T.primary;
-  return (
-    <div style={{display:"flex",gap:10,marginBottom:10}}>
-      <div style={{flexShrink:0,display:"flex",flexDirection:"column",alignItems:"center"}}>
-        <div style={{width:30,height:30,borderRadius:"50%",background:isStart||isEnd?"#E8F5E9":c,color:isStart||isEnd?T.success:"#fff",display:"flex",alignItems:"center",justifyContent:"center",fontSize:isNum?12:15,fontWeight:700,boxShadow:"0 2px 6px rgba(0,0,0,.12)"}}>{icon}</div>
-        {!isEnd&&<div style={{width:2,flex:1,background:T.border,marginTop:3,minHeight:16}}/>}
-      </div>
-      <div style={{flex:1,paddingBottom:6}}>
-        <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
-          <div>
-            <div style={{fontSize:13,fontWeight:700,color:isStart||isEnd?T.success:T.text}}>{label}</div>
-            {sub&&<div style={{fontSize:11,color:T.textMuted,marginTop:1}}>{sub}</div>}
-            {address&&<div style={{fontSize:11,color:T.textMuted,marginTop:1}}>📍 {address}</div>}
-          </div>
-          <div style={{textAlign:"right",flexShrink:0}}>
-            {time&&<div style={{fontSize:13,fontWeight:700,color:c}}>{time}</div>}
-            {start&&<div style={{fontSize:13,fontWeight:700,color:c}}>{start} – {finish}</div>}
-            {visitMins&&<div style={{fontSize:11,color:T.textMuted}}>看診 {visitMins} 分</div>}
-          </div>
-        </div>
-        {travel>0&&<div style={{fontSize:11,color:T.textMuted,marginTop:3,display:"flex",gap:8}}>
-          <span>🚗 車程約 {travel} 分</span>
-          {wait>0&&<span>⏳ 等候 {wait} 分</span>}
-        </div>}
-      </div>
-    </div>
-  );
-}
-
-ReactDOM.createRoot(document.getElementById("root")).render(<App />);
-</script></body></html>
+                sub={[stop.patient.chartNo&&`#${stop.patient.chartNo}`,stop.patient.diagnosis].
