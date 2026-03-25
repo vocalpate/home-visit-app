@@ -426,6 +426,13 @@ function ScheduleView({ doctor, docColor, patients, scheduleData, onSave, defaul
   const [search, setSearch] = useState("");
   const [editing, setEditing] = useState(null);
 
+  // 同步更新個案地址到 localStorage（個案管理 App 共用）
+  const savePatientAddress = (patientId, address) => {
+    const all = JSON.parse(localStorage.getItem(LOCAL_KEY_PATIENTS)||"[]");
+    const next = all.map(p => p.id===patientId ? {...p, address} : p);
+    localStorage.setItem(LOCAL_KEY_PATIENTS, JSON.stringify(next));
+  };
+
   const filtered = patients.filter(p=>!search||(p.name||"").includes(search)||(p.chartNo||"").includes(search));
 
   return (
@@ -457,13 +464,14 @@ function ScheduleView({ doctor, docColor, patients, scheduleData, onSave, defaul
           isEditing={editing===p.id}
           onToggle={()=>setEditing(editing===p.id?null:p.id)}
           onSave={data=>{onSave(p.id,data);setEditing(null);}}
+          onSaveAddress={(addr)=>savePatientAddress(p.id,addr)}
           defaultVisitMins={defaultVisitMins}/>
       ))}
     </div>
   );
 }
 
-function PatientScheduleCard({ p, docColor, schedule, isEditing, onToggle, onSave, defaultVisitMins }) {
+function PatientScheduleCard({ p, docColor, schedule, isEditing, onToggle, onSave, onSaveAddress, defaultVisitMins }) {
   const [s, setS] = useState(()=>({
     windowStart: schedule.windowStart||"09:00",
     windowEnd:   schedule.windowEnd||"17:00",
@@ -472,8 +480,19 @@ function PatientScheduleCard({ p, docColor, schedule, isEditing, onToggle, onSav
     wed: schedule.wed||{enabled:false}, thu: schedule.thu||{enabled:false},
     fri: schedule.fri||{enabled:false},
   }));
+  const [address, setAddress] = useState(p.address||"");
+  const [addrSaved, setAddrSaved] = useState(false);
   const enabledDays = DAY_KEYS.filter(dk=>s[dk]?.enabled);
   const inp={padding:"8px 10px",borderRadius:7,border:`1.5px solid ${T.border}`,fontSize:13,background:"#fff"};
+
+  const handleSave = () => {
+    // 若地址有變動，同步更新個案資料
+    if (address.trim() !== (p.address||"").trim()) {
+      onSaveAddress(address.trim());
+      p.address = address.trim(); // 更新本地參考
+    }
+    onSave(s);
+  };
 
   return (
     <div style={{background:T.card,borderRadius:12,marginBottom:8,boxShadow:"0 1px 8px rgba(0,0,0,0.06)",overflow:"hidden"}}>
@@ -506,8 +525,25 @@ function PatientScheduleCard({ p, docColor, schedule, isEditing, onToggle, onSav
             <div><label style={{fontSize:11,color:T.textMuted,display:"block",marginBottom:3,fontWeight:600}}>結束時間</label><input style={inp} type="time" value={s.windowEnd} onChange={e=>setS(p=>({...p,windowEnd:e.target.value}))}/></div>
             <div><label style={{fontSize:11,color:T.textMuted,display:"block",marginBottom:3,fontWeight:600}}>看診分鐘</label><input style={inp} type="number" min="10" max="120" value={s.visitMins} onChange={e=>setS(p=>({...p,visitMins:parseInt(e.target.value)||defaultVisitMins}))}/></div>
           </div>
-          {p.address?<div style={{fontSize:12,color:T.textMuted,marginBottom:10}}>📍 {p.address}</div>:<div style={{fontSize:12,color:T.danger,marginBottom:10}}>⚠️ 未填地址，無法加入路線規劃</div>}
-          <button onClick={()=>onSave(s)} style={{background:`linear-gradient(135deg,${T.primaryDark},${T.primary})`,color:"#fff",border:"none",borderRadius:8,padding:"8px 18px",fontSize:13,fontWeight:700,cursor:"pointer"}}>✅ 儲存</button>
+
+          {/* 地址欄位：自動帶入，可修改並同步回個案資料 */}
+          <div style={{marginBottom:12}}>
+            <label style={{fontSize:11,color:T.textMuted,display:"block",marginBottom:4,fontWeight:600}}>
+              患者地址
+              {!p.address && <span style={{color:T.danger,marginLeft:6}}>（個案資料未填，請在此補充）</span>}
+              {p.address && address===p.address && <span style={{color:T.success,marginLeft:6}}>✅ 已從個案資料帶入</span>}
+              {p.address && address!==p.address && address && <span style={{color:T.warning,marginLeft:6}}>⚠️ 儲存後將同步更新個案資料</span>}
+            </label>
+            <input
+              style={{...inp, width:"100%", background: address?"#fff":"#FFF8E1", border:`1.5px solid ${address?T.border:T.warning}`}}
+              value={address}
+              onChange={e=>setAddress(e.target.value)}
+              placeholder="請填入完整地址，例：高雄市○○區○○路123號"
+            />
+            {!address && <div style={{fontSize:11,color:T.danger,marginTop:4}}>⚠️ 未填地址，此患者無法加入路線規劃</div>}
+          </div>
+
+          <button onClick={handleSave} style={{background:`linear-gradient(135deg,${T.primaryDark},${T.primary})`,color:"#fff",border:"none",borderRadius:8,padding:"8px 18px",fontSize:13,fontWeight:700,cursor:"pointer"}}>✅ 儲存</button>
         </div>
       )}
     </div>
