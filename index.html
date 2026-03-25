@@ -26,8 +26,6 @@
     ::-webkit-scrollbar-track { background:#f0ede6; }
     ::-webkit-scrollbar-thumb { background:#b5c4b1; border-radius:3px; }
     .chk { width:20px; height:20px; cursor:pointer; accent-color:#2D6A4F; flex-shrink:0; }
-    .tab-btn { flex: 1; padding: 12px; text-align: center; font-size: 15px; font-weight: 700; cursor: pointer; border: none; background: transparent; color: #fff; opacity: 0.6; transition: all 0.2s; }
-    .tab-btn.active { opacity: 1; border-bottom: 3px solid #fff; }
   </style>
 </head>
 <body>
@@ -46,13 +44,11 @@ const daysUntil = ds => { if(!ds) return null; const t=new Date(); t.setHours(0,
 const fmt = ds => { if(!ds) return "—"; const [y,m,d]=ds.split("-"); return `${y}/${m}/${d}`; };
 const genId = () => "P"+Date.now().toString().slice(-8)+Math.random().toString(36).slice(2,5);
 const LOCAL_KEY = "home_visit_v2";
-const GMAPS_KEY = "gmaps_api_key";
+const loadLocal = () => { try { return JSON.parse(localStorage.getItem(LOCAL_KEY)||"[]"); } catch { return []; } };
+const saveLocal = d => localStorage.setItem(LOCAL_KEY, JSON.stringify(d));
 const GAS_KEY = "gas_url_v2";
 
-// 安全讀寫 LocalStorage (防無痕模式崩潰)
-const loadLocal = () => { try { return JSON.parse(localStorage.getItem(LOCAL_KEY)||"[]"); } catch(e) { return []; } };
-const saveLocal = d => { try { localStorage.setItem(LOCAL_KEY, JSON.stringify(d)); } catch(e){} };
-
+// Excel 欄位自動對應
 const FIELD_MAP = [
   { key:"name",         patterns:["病患姓名","姓名","名字","name"] },
   { key:"chartNo",      patterns:["掛號證","病歷號","病歷證","chart"] },
@@ -66,6 +62,7 @@ const FIELD_MAP = [
   { key:"diagnosis",    patterns:["病名","病症","診斷"] },
   { key:"admitDate",    patterns:["收案日","入案日","收案日期","入案日期"] },
   { key:"closeDate",    patterns:["結案日","結案日期"] },
+  // 門診日期不匯入（不等於收案日期）
 ];
 function matchField(header) {
   const h=(header||"").toLowerCase();
@@ -75,9 +72,11 @@ function matchField(header) {
   return null;
 }
 
+// 民國年轉西元：115/01/01 → 2026-01-01
 function convertROCDate(val) {
   if (!val) return "";
   const s = String(val).trim();
+  // 格式：NNN/MM/DD 或 NNN-MM-DD
   const m = s.match(/^(\d{2,3})[\/\-](\d{1,2})[\/\-](\d{1,2})$/);
   if (m) {
     const y = parseInt(m[1]) + 1911;
@@ -85,11 +84,13 @@ function convertROCDate(val) {
     const d  = m[3].padStart(2,"0");
     return `${y}-${mo}-${d}`;
   }
+  // 已是西元格式 YYYY-MM-DD 或 YYYY/MM/DD
   const m2 = s.match(/^(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})$/);
   if (m2) return `${m2[1]}-${m2[2].padStart(2,"0")}-${m2[3].padStart(2,"0")}`;
   return s;
 }
 
+// FormField（外部定義避免游標跳動）
 function FormField({ label, full, required, hasErr, errMsg, children }) {
   return (
     <div style={{ gridColumn: full?"1 / -1":"auto" }}>
@@ -107,6 +108,7 @@ const inpStyle = hasErr => ({
   fontSize:14, background:"#fff", color:T.text,
 });
 
+// Dialog
 function Dialog({ children, onClose, wide }) {
   return (
     <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.55)", display:"flex", alignItems:"center", justifyContent:"center", zIndex:200, padding:16 }}>
@@ -117,235 +119,10 @@ function Dialog({ children, onClose, wide }) {
   );
 }
 
-// ════════════ 路線規劃模組 ════════════
-function RoutePlanner({ patients, pushToast }) {
-  const [apiKey, setApiKey] = useState(() => { try { return localStorage.getItem(GMAPS_KEY) || ""; } catch(e){ return ""; } });
-  const [startLoc, setStartLoc] = useState("高雄市");
-  const [startTime, setStartTime] = useState("09:00");
-  const [bufferTime, setBufferTime] = useState(5);
-  const [lunchStart, setLunchStart] = useState("12:00");
-  const [lunchEnd, setLunchEnd] = useState("13:30");
-  const [targetDate, setTargetDate] = useState(new Date().toISOString().split("T")[0]);
-  const [selectedIds, setSelectedIds] = useState(new Set());
-  const [routeResults, setRouteResults] = useState(null);
-  const [calculating, setCalculating] = useState(false);
-  const [draggedIdx, setDraggedIdx] = useState(null);
-
-  const dayOfWeek = targetDate ? new Date(targetDate).getDay() : 1;
-  const dayMap = ["日", "一", "二", "三", "四", "五", "六"];
-  const targetDayStr = dayMap[dayOfWeek];
-
-  const availablePatients = patients.filter(p => {
-    if (p.closedAt || daysUntil(p.closeDate) < 0) return false;
-    if (!p.availDays || p.availDays.length === 0) return true; 
-    return p.availDays.includes(targetDayStr);
-  });
-
-  const toggleSelect = id => {
-    setSelectedIds(prev => {
-      const s = new Set(prev);
-      s.has(id) ? s.delete(id) : s.add(id);
-      return s;
-    });
-  };
-
-  const loadGoogleMaps = () => {
-    return new Promise((resolve, reject) => {
-      if (window.google && window.google.maps) return resolve();
-      const script = document.createElement("script");
-      script.src = `https://maps.googleapis.com/maps/api/js?key=${apiKey}`;
-      script.async = true;
-      script.defer = true;
-      script.onload = resolve;
-      script.onerror = reject;
-      document.head.appendChild(script);
-    });
-  };
-
-  const calculateRoute = async (orderedPatients) => {
-    if (!apiKey) return pushToast("⚠️ 請先輸入 Google Maps API 金鑰", "danger");
-    if (orderedPatients.length === 0) return pushToast("⚠️ 請至少選擇一位病患", "danger");
-    
-    setCalculating(true);
-    try { localStorage.setItem(GMAPS_KEY, apiKey); } catch(e){}
-
-    try {
-      await loadGoogleMaps();
-      const service = new window.google.maps.DistanceMatrixService();
-      
-      const waypoints = [startLoc, ...orderedPatients.map(p => p.address)];
-      const request = {
-        origins: waypoints.slice(0, -1),
-        destinations: waypoints.slice(1),
-        travelMode: 'DRIVING',
-      };
-
-      service.getDistanceMatrix(request, (response, status) => {
-        if (status !== 'OK') {
-          pushToast(`❌ 距離計算失敗: ${status}`, "danger");
-          setCalculating(false);
-          return;
-        }
-
-        let results = [];
-        let currentTime = new Date(`1970/01/01 ${startTime}`);
-        const lunchS = new Date(`1970/01/01 ${lunchStart}`);
-        const lunchE = new Date(`1970/01/01 ${lunchEnd}`);
-
-        for (let i = 0; i < orderedPatients.length; i++) {
-          let travelInfo = response.rows[i].elements[i];
-          if (travelInfo.status !== 'OK') {
-            results.push({ ...orderedPatients[i], error: "無法計算地址" });
-            continue;
-          }
-
-          let travelMins = Math.ceil(travelInfo.duration.value / 60);
-          currentTime.setMinutes(currentTime.getMinutes() + travelMins + Number(bufferTime));
-
-          let isLunch = false;
-          if (currentTime >= lunchS && currentTime < lunchE) {
-             isLunch = true;
-             currentTime = new Date(`1970/01/01 ${lunchEnd}`);
-             currentTime.setMinutes(currentTime.getMinutes() + travelMins); 
-          }
-
-          let arrivalTimeStr = currentTime.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
-          let duration = (orderedPatients[i] && orderedPatients[i].duration) ? Number(orderedPatients[i].duration) : 25;
-          currentTime.setMinutes(currentTime.getMinutes() + duration);
-          let finishTimeStr = currentTime.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
-
-          results.push({
-            ...orderedPatients[i],
-            travelMins, arrivalTimeStr, finishTimeStr, isLunch, calcDuration: duration
-          });
-        }
-        setRouteResults(results);
-        setCalculating(false);
-        pushToast("✅ 路線計算完成");
-      });
-    } catch (err) {
-      pushToast("❌ Google Maps 載入失敗，請檢查金鑰", "danger");
-      setCalculating(false);
-    }
-  };
-
-  const handleStartRouting = () => {
-    const selectedList = availablePatients.filter(p => selectedIds.has(p.id));
-    calculateRoute(selectedList);
-  };
-
-  const handleDragStart = (e, idx) => setDraggedIdx(idx);
-  const handleDragOver = e => e.preventDefault();
-  const handleDrop = (e, idx) => {
-    e.preventDefault();
-    if (draggedIdx === null || draggedIdx === idx) return;
-    const newList = [...routeResults];
-    const [movedItem] = newList.splice(draggedIdx, 1);
-    newList.splice(idx, 0, movedItem);
-    calculateRoute(newList);
-    setDraggedIdx(null);
-  };
-
-  return (
-    <div style={{ animation:"fadeIn .3s ease" }}>
-      <div style={{ background:"#fff", borderRadius:16, padding:18, marginBottom:16, boxShadow:"0 2px 12px rgba(0,0,0,0.05)" }}>
-        <h3 style={{ fontSize:16, marginBottom:14, color:T.primaryDark, display:'flex', alignItems:'center', gap:6 }}>⚙️ 排程設定</h3>
-        <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:12, marginBottom:12 }}>
-          <FormField label="Google Maps 金鑰" full>
-            <input type="password" style={inpStyle()} value={apiKey} onChange={e=>setApiKey(e.target.value)} placeholder="AIzaSy..." />
-          </FormField>
-          <FormField label="出發日期">
-            <input type="date" style={inpStyle()} value={targetDate} onChange={e=>setTargetDate(e.target.value)} />
-          </FormField>
-          <FormField label="出發地點">
-            <input type="text" style={inpStyle()} value={startLoc} onChange={e=>setStartLoc(e.target.value)} />
-          </FormField>
-          <FormField label="出發時間">
-            <input type="time" style={inpStyle()} value={startTime} onChange={e=>setStartTime(e.target.value)} />
-          </FormField>
-          <FormField label="站間緩衝(分)">
-            <input type="number" style={inpStyle()} value={bufferTime} onChange={e=>setBufferTime(e.target.value)} />
-          </FormField>
-          <FormField label="午休起">
-            <input type="time" style={inpStyle()} value={lunchStart} onChange={e=>setLunchStart(e.target.value)} />
-          </FormField>
-          <FormField label="午休迄">
-            <input type="time" style={inpStyle()} value={lunchEnd} onChange={e=>setLunchEnd(e.target.value)} />
-          </FormField>
-        </div>
-      </div>
-
-      {!routeResults && (
-        <div style={{ background:"#fff", borderRadius:16, padding:18, boxShadow:"0 2px 12px rgba(0,0,0,0.05)" }}>
-          <h3 style={{ fontSize:16, marginBottom:10, color:T.text }}>請勾選 {targetDate} (週{targetDayStr}) 預計訪視名單</h3>
-          <div style={{ maxHeight:250, overflowY:'auto', marginBottom:14, border:`1px solid ${T.border}`, borderRadius:8, padding:8 }}>
-            {availablePatients.length === 0 ? <div style={{padding:10, color:T.textMuted, textAlign:'center'}}>當日無可排程個案</div> :
-              availablePatients.map(p => (
-              <div key={p.id} onClick={()=>toggleSelect(p.id)} style={{ display:'flex', alignItems:'center', padding:10, borderBottom:`1px solid ${T.border}`, cursor:'pointer', background:selectedIds.has(p.id)?'#EAF4EE':'#fff' }}>
-                <input type="checkbox" className="chk" checked={selectedIds.has(p.id)} readOnly style={{ marginRight:10 }} />
-                <div>
-                  <div style={{ fontWeight:700 }}>{p.name} <span style={{fontSize:12, color:T.textMuted, fontWeight:400}}>({p.duration||25}分)</span></div>
-                  <div style={{ fontSize:12, color:T.textMuted }}>{p.address}</div>
-                </div>
-              </div>
-            ))}
-          </div>
-          <button onClick={handleStartRouting} disabled={calculating || selectedIds.size===0} style={{ width:"100%", padding:14, borderRadius:10, background:calculating?"#ccc":`linear-gradient(135deg,${T.primary},${T.primaryLight})`, color:"#fff", border:"none", fontSize:16, fontWeight:700, cursor:calculating?"not-allowed":"pointer" }}>{calculating ? "計算中..." : "🚀 開始規劃路線"}</button>
-        </div>
-      )}
-
-      {routeResults && (
-        <div style={{ background:"#fff", borderRadius:16, padding:18, boxShadow:"0 2px 12px rgba(0,0,0,0.05)" }}>
-          <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:10 }}>
-            <h3 style={{ fontSize:16, color:T.primaryDark }}>📍 每日時間軸</h3>
-            <button onClick={()=>setRouteResults(null)} style={{ background:"none", border:"none", color:T.textMuted, cursor:"pointer", textDecoration:"underline" }}>重新選擇</button>
-          </div>
-          <p style={{ fontSize: 12, color: T.danger, marginBottom: 12, fontWeight:700 }}>💡 提示：按住卡片可上下拖曳微調順序，系統會自動重算時間。</p>
-          
-          <div style={{ background: "#e9ecef", marginBottom: 8, padding: 10, borderRadius: 8 }}>
-            <strong>🏁 出發地：{startLoc}</strong> <br/>
-            <span style={{fontSize:13, color:T.textMuted}}>🕒 出發時間：{startTime}</span>
-          </div>
-
-          {routeResults.map((p, idx) => (
-            <div key={p.id}>
-              {p.isLunch && (
-                <div style={{ background: "#ffeeba", marginBottom: 8, padding: 10, borderRadius: 8, textAlign: "center", color:"#856404" }}>
-                  <strong>🍱 午休時間</strong> ({lunchStart} - {lunchEnd})
-                </div>
-              )}
-              <div 
-                draggable
-                onDragStart={e => handleDragStart(e, idx)}
-                onDragOver={handleDragOver}
-                onDrop={e => handleDrop(e, idx)}
-                style={{ background: "#fff", border: `2px solid ${T.primaryLight}`, marginBottom: 8, padding: 12, borderRadius: 8, cursor: "grab", boxShadow:"0 2px 4px rgba(0,0,0,0.05)" }}>
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
-                  <div>
-                    <div style={{ fontSize:15, fontWeight:700 }}>{idx+1}. {p.name} <span style={{fontSize:12, fontWeight:400, color:T.textMuted}}>({p.calcDuration}分)</span></div>
-                    {p.error ? <div style={{ color:T.danger, fontSize:13 }}>{p.error}</div> : (
-                      <React.Fragment>
-                        <div style={{ fontSize:13, color:T.textMuted, margin:"4px 0" }}>🚗 車程約 {p.travelMins} 分鐘</div>
-                        <div style={{ fontSize:14 }}>🕒 抵達: <span style={{ color:T.danger, fontWeight:700 }}>{p.arrivalTimeStr}</span> ~ {p.finishTimeStr}</div>
-                      </React.Fragment>
-                    )}
-                    <div style={{ fontSize:12, color:T.textMuted, marginTop:4 }}>🏠 {p.address}</div>
-                  </div>
-                  <a href={`https://www.google.com/maps/dir/?api=1&origin=${encodeURIComponent(idx===0?startLoc:routeResults[idx-1].address)}&destination=${encodeURIComponent(p.address)}&travelmode=driving`} target="_blank" style={{ background: T.primary, color: "white", padding: "6px 12px", textDecoration: "none", borderRadius: 6, fontSize: 13, fontWeight:700 }}>導航</a>
-                </div>
-              </div>
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
-
-// ════════════ 主程式 App ════════════
+// ════════════════════════════════════════════════════════════
 function App() {
   const [patients, setPatients]   = useState([]);
-  const [view, setView]           = useState("list"); 
+  const [view, setView]           = useState("list");
   const [editing, setEditing]     = useState(null);
   const [search, setSearch]       = useState("");
   const [sortBy, setSortBy]       = useState("chartNo");
@@ -353,10 +130,8 @@ function App() {
   const [toast, setToast]         = useState(null);
   const [busy, setBusy]           = useState(false);
   const [delTarget, setDelTarget] = useState(null);
-  
-  const [gasUrl, setGasUrl]       = useState(()=>{ try{ return localStorage.getItem(GAS_KEY)||""; }catch(e){ return ""; } });
-  const [gasDraft, setGasDraft]   = useState(()=>{ try{ return localStorage.getItem(GAS_KEY)||""; }catch(e){ return ""; } });
-  
+  const [gasUrl, setGasUrl]       = useState(()=>localStorage.getItem(GAS_KEY)||"");
+  const [gasDraft, setGasDraft]   = useState(()=>localStorage.getItem(GAS_KEY)||"");
   const [showSettings, setShowSettings] = useState(false);
   const [selectMode, setSelectMode]     = useState(false);
   const [selected, setSelected]         = useState(new Set());
@@ -369,9 +144,7 @@ function App() {
 
   const pushToast = (msg,type="ok") => setToast({msg,type});
   const syncGAS = useCallback(async (action,payload) => {
-    let url = "";
-    try { url = localStorage.getItem(GAS_KEY); } catch(e){}
-    if(!url) return;
+    const url=localStorage.getItem(GAS_KEY); if(!url) return;
     try { await fetch(url,{method:"POST",mode:"no-cors",headers:{"Content-Type":"application/json"},body:JSON.stringify({action,...payload})}); }
     catch(e){console.warn(e);}
   },[]);
@@ -397,4 +170,457 @@ function App() {
 
   const bulkDelete = () => {
     const ids=[...selected];
-    persist(patients.filter(p=>!ids.includes(p.
+    persist(patients.filter(p=>!ids.includes(p.id)));
+    ids.forEach(id=>syncGAS("delete",{patientId:id}));
+    pushToast(`🗑️ 已刪除 ${ids.length} 位個案`,"danger");
+    setSelected(new Set()); setSelectMode(false); setConfirmBulkDel(false);
+  };
+
+  const toggleSelect = id => setSelected(prev=>{ const s=new Set(prev); s.has(id)?s.delete(id):s.add(id); return s; });
+
+  const closePatient = id => {
+    const updated=patients.map(p=>p.id===id?{...p,closedAt:new Date().toISOString().split("T")[0]}:p);
+    persist(updated); const p=updated.find(x=>x.id===id);
+    syncGAS("update",{patient:p}); pushToast(`📁 已結案：${p?.name}`); setEditing(p);
+  };
+  const reopenPatient = id => {
+    const updated=patients.map(p=>p.id===id?{...p,closedAt:""}:p);
+    persist(updated); const p=updated.find(x=>x.id===id);
+    syncGAS("update",{patient:p}); pushToast(`🔄 已重新開案：${p?.name}`); setEditing(p);
+  };
+
+  // Excel 匯入
+  const handleExcelFile = e => {
+    const file=e.target.files[0]; if(!file) return;
+    const reader=new FileReader();
+    reader.onload = evt => {
+      try {
+        const wb=XLSX.read(evt.target.result,{type:"binary"});
+        const ws=wb.Sheets[wb.SheetNames[0]];
+        const rows=XLSX.utils.sheet_to_json(ws,{header:1,defval:""});
+        if(rows.length<2){pushToast("⚠️ Excel 內容為空","danger"); return;}
+
+        // 自動偵測標題列：找第一個「能對應到至少2個欄位，且包含姓名或病歷號」的列
+        let headerRowIdx = -1;
+        let colMap = {};
+        for (let ri=0; ri<Math.min(rows.length,10); ri++) {
+          const tryHeaders = rows[ri].map(h=>String(h).trim());
+          const tryMap = {};
+          tryHeaders.forEach((h,i)=>{ const k=matchField(h); if(k) tryMap[i]=k; });
+          const vals = Object.values(tryMap);
+          const hasKey = vals.includes("name") || vals.includes("chartNo");
+          if (Object.keys(tryMap).length >= 2 && hasKey) {
+            headerRowIdx = ri;
+            colMap = tryMap;
+            break;
+          }
+        }
+        if (headerRowIdx < 0) { pushToast("❌ 找不到可對應的標題列（需含姓名或病歷號欄）","danger"); return; }
+
+        const existingNames=new Set(patients.map(p=>p.name));
+        const seenInFile=new Set();
+        const toAdd=[], skippedDup=[], skippedExist=[];
+        for(let r=headerRowIdx+1; r<rows.length; r++){
+          const row=rows[r];
+          if(row.every(c=>!String(c).trim())) continue;
+          const rec={};
+          Object.entries(colMap).forEach(([i,k])=>{
+            let v = String(row[i]||"").trim();
+            // 日期欄位：嘗試轉換民國年
+            if ((k==="admitDate"||k==="closeDate") && v) v = convertROCDate(v);
+            rec[k]=v;
+          });
+          const name=rec.name||""; if(!name) continue;
+          if(seenInFile.has(name)){skippedDup.push(name); continue;}
+          seenInFile.add(name);
+          if(existingNames.has(name)){skippedExist.push(name); continue;}
+          toAdd.push({...rec, id:genId(), closeDate:rec.closeDate||addDays(rec.admitDate,365)});
+        }
+        setImportResult({toAdd,skippedDup,skippedExist});
+      } catch(err){ pushToast("❌ 讀取 Excel 失敗","danger"); }
+      e.target.value="";
+    };
+    reader.readAsBinaryString(file);
+  };
+
+  const confirmImport = () => {
+    const next=[...patients,...importResult.toAdd];
+    persist(next);
+    importResult.toAdd.forEach(p=>syncGAS("create",{patient:p}));
+    pushToast(`✅ 成功導入 ${importResult.toAdd.length} 筆`);
+    setImportResult(null);
+  };
+
+  const alertCount=patients.filter(p=>{ const d=daysUntil(p.closeDate); return !p.closedAt&&d!==null&&d>=0&&d<=30; }).length;
+
+  const filtered=patients
+    .filter(p=>{
+      const q=search.toLowerCase();
+      const hit=!search||[p.name,p.chartNo,p.phone,p.address].some(v=>(v||"").toLowerCase().includes(q));
+      if(onlyAlert){const d=daysUntil(p.closeDate); return hit&&!p.closedAt&&d!==null&&d<=30;}
+      return hit;
+    })
+    .sort((a,b)=>{
+      const cmp=(va,vb)=>{if(!va&&!vb)return 0;if(!va)return 1;if(!vb)return -1;return va.localeCompare(vb,"zh-TW",{numeric:true});};
+      if(sortBy==="name") return cmp(a.name,b.name);
+      if(sortBy==="admitDate") return cmp(a.admitDate,b.admitDate);
+      if(sortBy==="closeDate") return cmp(a.closeDate,b.closeDate);
+      const hasA=!!a.chartNo,hasB=!!b.chartNo;
+      if(hasA&&hasB) return cmp(a.chartNo,b.chartNo);
+      if(!hasA&&!hasB) return cmp(a.admitDate,b.admitDate)||cmp(a.name,b.name);
+      return hasA?-1:1;
+    });
+
+  const allSel=filtered.length>0&&filtered.every(p=>selected.has(p.id));
+
+  return (
+    <div style={{ minHeight:"100vh", background:T.bg }}>
+      {/* Header */}
+      <header style={{ background:`linear-gradient(135deg,${T.primaryDark} 0%,${T.primary} 100%)`, color:"#fff", padding:"14px 16px", display:"flex", alignItems:"center", justifyContent:"space-between", boxShadow:"0 3px 16px rgba(0,0,0,0.2)", position:"sticky", top:0, zIndex:100 }}>
+        <div style={{ display:"flex", alignItems:"center", gap:10 }}>
+          <div style={{ background:"rgba(255,255,255,0.15)", borderRadius:10, width:38, height:38, display:"flex", alignItems:"center", justifyContent:"center", fontSize:20 }}>🏥</div>
+          <div>
+            <div style={{ fontSize:15, fontWeight:700, letterSpacing:.5 }}>居家醫療管理系統</div>
+            <div style={{ fontSize:10, opacity:.7, marginTop:1 }}>中醫居家訪視個案管理</div>
+          </div>
+        </div>
+        <div style={{ display:"flex", gap:8, alignItems:"center" }}>
+          {alertCount>0 && <button onClick={()=>{setOnlyAlert(v=>!v);setView("list");}} style={{ background:onlyAlert?T.warning:"rgba(255,255,255,0.15)", border:`1.5px solid ${onlyAlert?T.warning:"rgba(255,255,255,0.3)"}`, color:"#fff", borderRadius:20, padding:"5px 12px", fontSize:12, fontWeight:700, cursor:"pointer" }}>⚠️ 即將結案 {alertCount}</button>}
+          <button onClick={()=>{setGasDraft(gasUrl);setShowSettings(v=>!v);}} style={{ background:"rgba(255,255,255,0.15)", border:"1px solid rgba(255,255,255,0.25)", borderRadius:8, padding:"7px 10px", color:"#fff", cursor:"pointer", fontSize:14 }}>⚙️</button>
+        </div>
+      </header>
+
+      {/* Settings */}
+      {showSettings && (
+        <div style={{ background:T.primaryDark, color:"#fff", padding:"14px 16px", borderBottom:`2px solid ${T.primaryLight}` }}>
+          <div style={{ fontSize:12, opacity:.75, marginBottom:6 }}>Google Apps Script 網址</div>
+          <div style={{ display:"flex", gap:8 }}>
+            <input value={gasDraft} onChange={e=>setGasDraft(e.target.value)} placeholder="https://script.google.com/macros/s/.../exec"
+              style={{ flex:1, padding:"8px 12px", borderRadius:7, border:"1px solid rgba(255,255,255,0.2)", background:"rgba(255,255,255,0.1)", color:"#fff", fontSize:13 }} />
+            <button onClick={()=>{localStorage.setItem(GAS_KEY,gasDraft);setGasUrl(gasDraft);pushToast("✅ GAS 網址已儲存");setShowSettings(false);}}
+              style={{ background:T.primaryLight, border:"none", borderRadius:7, padding:"8px 16px", color:"#fff", cursor:"pointer", fontWeight:700, fontSize:13 }}>儲存</button>
+          </div>
+          {gasUrl?<div style={{ fontSize:11, marginTop:6, color:T.primaryLight }}>✅ 已設定同步網址</div>:<div style={{ fontSize:11, marginTop:6, opacity:.55 }}>未設定時資料僅存於瀏覽器本機</div>}
+        </div>
+      )}
+
+      <div style={{ maxWidth:820, margin:"0 auto", padding:"14px 12px 60px" }}>
+        {view==="list" && (
+          <div style={{ animation:"fadeIn .3s ease" }}>
+            {/* 搜尋 + 新增 */}
+            <div style={{ display:"flex", gap:8, marginBottom:10 }}>
+              <div style={{ flex:1, position:"relative" }}>
+                <span style={{ position:"absolute", left:12, top:"50%", transform:"translateY(-50%)", color:T.textMuted, fontSize:15, pointerEvents:"none" }}>🔍</span>
+                <input value={search} onChange={e=>setSearch(e.target.value)} placeholder="搜尋姓名、病歷號、電話..."
+                  style={{ width:"100%", padding:"11px 12px 11px 36px", borderRadius:10, border:`1.5px solid ${T.border}`, fontSize:14, background:"#fff", color:T.text }} />
+              </div>
+              <button onClick={()=>{setEditing(null);setView("form");}} style={{ background:`linear-gradient(135deg,${T.primary},${T.primaryLight})`, color:"#fff", border:"none", borderRadius:10, padding:"11px 18px", fontSize:14, fontWeight:700, cursor:"pointer", whiteSpace:"nowrap", boxShadow:"0 2px 10px rgba(45,106,79,0.35)" }}>＋ 新增個案</button>
+            </div>
+
+            {/* 排序 + 匯入 + 多選 */}
+            <div style={{ display:"flex", gap:6, marginBottom:12, alignItems:"center", flexWrap:"wrap" }}>
+              <span style={{ fontSize:11, color:T.textMuted, marginRight:2 }}>排序：</span>
+              {[["chartNo","病歷號"],["name","姓名"],["admitDate","收案日"],["closeDate","結案日"]].map(([k,lbl])=>(
+                <button key={k} onClick={()=>setSortBy(k)} style={{ background:sortBy===k?T.primary:"#fff", color:sortBy===k?"#fff":T.textMuted, border:`1.5px solid ${sortBy===k?T.primary:T.border}`, borderRadius:16, padding:"4px 12px", fontSize:12, cursor:"pointer", fontWeight:sortBy===k?700:400 }}>{lbl}</button>
+              ))}
+              <div style={{ marginLeft:"auto", display:"flex", gap:6, alignItems:"center" }}>
+                <span style={{ fontSize:12, color:T.textMuted }}>{filtered.length} 位{patients.length!==filtered.length?` / 共 ${patients.length}`:""}</span>
+                <button onClick={()=>fileRef.current.click()} style={{ background:"#fff", border:`1.5px solid ${T.border}`, borderRadius:8, padding:"5px 10px", fontSize:12, cursor:"pointer", color:T.textMuted }}>📥 匯入</button>
+                <input ref={fileRef} type="file" accept=".xlsx,.xls,.csv" style={{ display:"none" }} onChange={handleExcelFile} />
+                <button onClick={()=>{setSelectMode(v=>!v);setSelected(new Set());}} style={{ background:selectMode?T.primary:"#fff", border:`1.5px solid ${selectMode?T.primary:T.border}`, borderRadius:8, padding:"5px 10px", fontSize:12, cursor:"pointer", color:selectMode?"#fff":T.textMuted, fontWeight:selectMode?700:400 }}>{selectMode?"✕ 取消":"☑ 多選"}</button>
+              </div>
+            </div>
+
+            {/* 多選工具列 */}
+            {selectMode && (
+              <div style={{ background:T.primaryDark, color:"#fff", borderRadius:10, padding:"10px 14px", marginBottom:10, display:"flex", alignItems:"center", gap:10, flexWrap:"wrap" }}>
+                <input type="checkbox" className="chk" checked={allSel} onChange={()=>{ allSel?setSelected(new Set()):setSelected(new Set(filtered.map(p=>p.id))); }} />
+                <span style={{ fontSize:13, flex:1 }}>{selected.size>0?`已選取 ${selected.size} 位`:"點選卡片或勾選框進行選取"}</span>
+                {selected.size>0 && <button onClick={()=>setConfirmBulkDel(true)} style={{ background:T.danger, border:"none", borderRadius:8, padding:"6px 14px", color:"#fff", fontSize:13, fontWeight:700, cursor:"pointer" }}>🗑️ 刪除已選 ({selected.size})</button>}
+              </div>
+            )}
+
+            {/* 列表 */}
+            {filtered.length===0?(
+              <div style={{ textAlign:"center", padding:"60px 0", color:T.textMuted }}>
+                <div style={{ fontSize:48, marginBottom:12 }}>📋</div>
+                <div style={{ fontSize:15 }}>{search||onlyAlert?"找不到符合的個案":"尚無資料，點擊「＋ 新增個案」開始"}</div>
+              </div>
+            ):(
+              filtered.map(p=>(
+                <PatientCard key={p.id} p={p} selectMode={selectMode} selected={selected.has(p.id)}
+                  onToggle={()=>toggleSelect(p.id)}
+                  onClick={()=>{ if(!selectMode){setEditing(p);setView("detail");}else toggleSelect(p.id); }} />
+              ))
+            )}
+          </div>
+        )}
+
+        {view==="form" && <PatientForm initial={editing} busy={busy} onSave={savePatient} onCancel={()=>setView(editing?"detail":"list")} />}
+        {view==="detail" && editing && <PatientDetail p={editing} onEdit={()=>setView("form")} onDelete={()=>setDelTarget(editing.id)} onClose={()=>closePatient(editing.id)} onReopen={()=>reopenPatient(editing.id)} onBack={()=>{setView("list");setEditing(null);}} />}
+      </div>
+
+      {/* Toast */}
+      {toast && <div style={{ position:"fixed", bottom:24, left:"50%", transform:"translateX(-50%)", zIndex:999, background:toast.type==="danger"?T.danger:T.primaryDark, color:"#fff", padding:"12px 26px", borderRadius:28, fontSize:14, fontWeight:600, boxShadow:"0 6px 24px rgba(0,0,0,0.25)", animation:"slideUp .3s ease", whiteSpace:"nowrap" }}>{toast.msg}</div>}
+
+      {/* 單筆刪除 */}
+      {delTarget && (
+        <Dialog onClose={()=>setDelTarget(null)}>
+          <div style={{ fontSize:36, marginBottom:10 }}>⚠️</div>
+          <div style={{ fontSize:16, fontWeight:700, marginBottom:8 }}>確認刪除此個案？</div>
+          <div style={{ fontSize:13, color:T.textMuted, marginBottom:22 }}>此操作無法復原</div>
+          <div style={{ display:"flex", gap:10 }}>
+            <button onClick={()=>setDelTarget(null)} style={{ flex:1, padding:11, borderRadius:9, border:`1.5px solid ${T.border}`, background:"#fff", cursor:"pointer" }}>取消</button>
+            <button onClick={()=>deletePatient(delTarget)} style={{ flex:1, padding:11, borderRadius:9, border:"none", background:T.danger, color:"#fff", cursor:"pointer", fontWeight:700 }}>確認刪除</button>
+          </div>
+        </Dialog>
+      )}
+
+      {/* 批次刪除 */}
+      {confirmBulkDel && (
+        <Dialog onClose={()=>setConfirmBulkDel(false)}>
+          <div style={{ fontSize:36, marginBottom:10 }}>🗑️</div>
+          <div style={{ fontSize:16, fontWeight:700, marginBottom:8 }}>確認刪除 {selected.size} 位個案？</div>
+          <div style={{ fontSize:13, color:T.textMuted, marginBottom:22 }}>此操作無法復原</div>
+          <div style={{ display:"flex", gap:10 }}>
+            <button onClick={()=>setConfirmBulkDel(false)} style={{ flex:1, padding:11, borderRadius:9, border:`1.5px solid ${T.border}`, background:"#fff", cursor:"pointer" }}>取消</button>
+            <button onClick={bulkDelete} style={{ flex:1, padding:11, borderRadius:9, border:"none", background:T.danger, color:"#fff", cursor:"pointer", fontWeight:700 }}>確認刪除</button>
+          </div>
+        </Dialog>
+      )}
+
+      {/* Excel 匯入預覽 */}
+      {importResult && (
+        <Dialog onClose={()=>setImportResult(null)} wide>
+          <div style={{ fontSize:24, marginBottom:12 }}>📥 確認匯入</div>
+          <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:8, marginBottom:16 }}>
+            <div style={{ background:"#E8F5E9", borderRadius:8, padding:"10px 0", textAlign:"center" }}>
+              <div style={{ fontSize:22, fontWeight:700, color:T.primary }}>{importResult.toAdd.length}</div>
+              <div style={{ fontSize:11, color:T.textMuted }}>新增</div>
+            </div>
+            <div style={{ background:"#FFF8E1", borderRadius:8, padding:"10px 0", textAlign:"center" }}>
+              <div style={{ fontSize:22, fontWeight:700, color:T.warning }}>{importResult.skippedExist.length}</div>
+              <div style={{ fontSize:11, color:T.textMuted }}>App 已有跳過</div>
+            </div>
+            <div style={{ background:"#FCE4EC", borderRadius:8, padding:"10px 0", textAlign:"center" }}>
+              <div style={{ fontSize:22, fontWeight:700, color:T.danger }}>{importResult.skippedDup.length}</div>
+              <div style={{ fontSize:11, color:T.textMuted }}>Excel 重複跳過</div>
+            </div>
+          </div>
+
+          {importResult.toAdd.length>0 && (
+            <div style={{ marginBottom:14, textAlign:"left" }}>
+              <div style={{ fontSize:12, fontWeight:700, color:T.textMuted, marginBottom:6 }}>即將新增：</div>
+              <div style={{ maxHeight:160, overflow:"auto", background:"#f9f9f9", borderRadius:8, padding:8 }}>
+                {importResult.toAdd.map((p,i)=>(
+                  <div key={i} style={{ fontSize:13, padding:"4px 0", borderBottom:`1px solid ${T.border}`, display:"flex", gap:8 }}>
+                    <span style={{ fontWeight:700 }}>{p.name}</span>
+                    {p.chartNo&&<span style={{ color:T.textMuted }}>#{p.chartNo}</span>}
+                    {p.diagnosis&&<span style={{ color:T.textMuted }}>｜{p.diagnosis}</span>}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {(importResult.skippedExist.length>0||importResult.skippedDup.length>0)&&(
+            <div style={{ fontSize:12, color:T.textMuted, marginBottom:14, background:"#f5f5f5", borderRadius:8, padding:8, textAlign:"left" }}>
+              {importResult.skippedExist.length>0&&<div>⏭️ App 已有（跳過）：{importResult.skippedExist.join("、")}</div>}
+              {importResult.skippedDup.length>0&&<div>⏭️ Excel 內重複（跳過）：{importResult.skippedDup.join("、")}</div>}
+            </div>
+          )}
+
+          {importResult.toAdd.length===0?(
+            <button onClick={()=>setImportResult(null)} style={{ width:"100%", padding:12, borderRadius:10, border:`1.5px solid ${T.border}`, background:"#fff", cursor:"pointer" }}>關閉</button>
+          ):(
+            <div style={{ display:"flex", gap:10 }}>
+              <button onClick={()=>setImportResult(null)} style={{ flex:1, padding:12, borderRadius:10, border:`1.5px solid ${T.border}`, background:"#fff", cursor:"pointer" }}>取消</button>
+              <button onClick={confirmImport} style={{ flex:2, padding:12, borderRadius:10, border:"none", background:`linear-gradient(135deg,${T.primary},${T.primaryLight})`, color:"#fff", cursor:"pointer", fontWeight:700, fontSize:15 }}>✅ 確認導入 {importResult.toAdd.length} 筆</button>
+            </div>
+          )}
+        </Dialog>
+      )}
+    </div>
+  );
+}
+
+// 個案卡片
+function PatientCard({ p, onClick, selectMode, selected, onToggle }) {
+  const days=daysUntil(p.closeDate);
+  const manuallyClosed=!!p.closedAt;
+  const expired=manuallyClosed||(days!==null&&days<0);
+  const alert30=!expired&&days!==null&&days<=30&&days>=0;
+  const [hover,setHover]=useState(false);
+  const bg=selected?"#EAF4EE":expired?"#EFEFEF":alert30?T.yellow:"#fff";
+  const border=expired?"#CCCCCC":selected?"#2D6A4F":alert30?T.yellowBorder:hover?T.primaryLight:T.border;
+  return (
+    <div onClick={onClick} onMouseEnter={()=>setHover(true)} onMouseLeave={()=>setHover(false)}
+      style={{ background:bg, border:`1.5px solid ${border}`, borderRadius:12, padding:"13px 16px", marginBottom:9, cursor:"pointer", opacity:expired?0.7:1, boxShadow:hover?"0 4px 18px rgba(0,0,0,0.1)":alert30?"0 2px 12px rgba(255,179,0,.18)":"0 1px 6px rgba(0,0,0,0.05)", transform:hover?"translateY(-1px)":"none", transition:"all .18s ease", display:"flex", alignItems:"center", gap:10 }}>
+      {selectMode && <input type="checkbox" className="chk" checked={selected} onChange={e=>{e.stopPropagation();onToggle();}} onClick={e=>e.stopPropagation()} />}
+      <div style={{ flex:1, minWidth:0 }}>
+        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start" }}>
+          <div style={{ flex:1, minWidth:0 }}>
+            <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:4, flexWrap:"wrap" }}>
+              <span style={{ fontSize:16, fontWeight:700, color:expired?"#888":T.text }}>{p.name||"（未填姓名）"}</span>
+              {alert30&&<span style={{ background:T.warning, color:"#fff", fontSize:10, fontWeight:700, padding:"2px 9px", borderRadius:10 }}>⚠️ {days} 天後結案</span>}
+              {expired&&<span style={{ background:"#999", color:"#fff", fontSize:10, fontWeight:700, padding:"2px 9px", borderRadius:10 }}>已結案</span>}
+            </div>
+            <div style={{ fontSize:12, color:T.textMuted, display:"flex", gap:12, flexWrap:"wrap" }}>
+              {p.chartNo&&<span>📋 {p.chartNo}</span>}
+              {p.phone&&<span>📞 {p.phone}</span>}
+              {p.team&&<span>👥 {p.team}</span>}
+              {p.diagnosis&&<span>🩺 {p.diagnosis}</span>}
+            </div>
+          </div>
+          <div style={{ textAlign:"right", fontSize:11, color:T.textMuted, flexShrink:0, marginLeft:10 }}>
+            <div>收案 {fmt(p.admitDate)}</div>
+            <div style={{ color:alert30?T.warning:T.textMuted, fontWeight:alert30?700:400, marginTop:2 }}>結案 {fmt(p.closeDate)}</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// 個案詳情
+function PatientDetail({ p, onEdit, onDelete, onClose, onReopen, onBack }) {
+  const days=daysUntil(p.closeDate);
+  const manuallyClosed=!!p.closedAt;
+  const alert30=!manuallyClosed&&days!==null&&days<=30&&days>=0;
+  const rows=[
+    ["病歷號",p.chartNo],["電話",p.phone],
+    ["住址",p.address,true],
+    ["緊急聯絡人",p.contact],["聯絡人電話",p.contactPhone],
+    ["收案團隊",p.team],["轉介單位",p.referral],
+    ["西醫診所",p.clinic],["主要病症",p.diagnosis],
+    ["收案日期",fmt(p.admitDate)],["結案日期",fmt(p.closeDate)],
+  ];
+  return (
+    <div style={{ animation:"fadeIn .25s ease" }}>
+      <button onClick={onBack} style={{ background:"none", border:"none", color:T.primary, fontSize:14, cursor:"pointer", marginBottom:14, fontWeight:600, padding:0 }}>← 返回列表</button>
+      <div style={{ background:manuallyClosed?"#F0F0F0":"#fff", borderRadius:16, overflow:"hidden", boxShadow:"0 2px 16px rgba(0,0,0,0.09)" }}>
+        <div style={{ background:manuallyClosed?"linear-gradient(135deg,#777,#999)":`linear-gradient(135deg,${T.primaryDark},${T.primary})`, padding:"20px 20px 18px", color:"#fff" }}>
+          <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start" }}>
+            <div>
+              <div style={{ display:"flex", alignItems:"center", gap:8 }}>
+                <div style={{ fontSize:22, fontWeight:700 }}>{p.name}</div>
+                {manuallyClosed&&<span style={{ background:"rgba(255,255,255,0.25)", fontSize:11, fontWeight:700, padding:"2px 10px", borderRadius:10 }}>已結案</span>}
+              </div>
+              <div style={{ fontSize:13, opacity:.75, marginTop:3 }}>{p.chartNo||"無病歷號"}</div>
+              {manuallyClosed&&p.closedAt&&<div style={{ fontSize:12, opacity:.8, marginTop:4 }}>結案日期：{fmt(p.closedAt)}</div>}
+            </div>
+            {alert30&&<div style={{ background:"rgba(255,255,255,0.15)", borderRadius:10, padding:"10px 16px", textAlign:"center", border:"1px solid rgba(255,255,255,0.3)" }}>
+              <div style={{ fontSize:10, opacity:.9 }}>距結案</div>
+              <div style={{ fontSize:22, fontWeight:700, color:"#FFE082" }}>{days} 天</div>
+            </div>}
+          </div>
+        </div>
+        <div style={{ padding:20 }}>
+          <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:"12px 20px", marginBottom:16 }}>
+            {rows.map(([lbl,val,full])=>(
+              <div key={lbl} style={{ gridColumn:full?"1 / -1":"auto", borderBottom:`1px solid ${T.border}`, paddingBottom:8 }}>
+                <div style={{ fontSize:11, color:T.textMuted, marginBottom:2 }}>{lbl}</div>
+                <div style={{ fontSize:14, color:val?T.text:T.textMuted, fontStyle:val?"normal":"italic" }}>{val||"—"}</div>
+              </div>
+            ))}
+          </div>
+          {p.notes&&<div style={{ background:T.bg, borderRadius:9, padding:"10px 14px", marginBottom:16 }}>
+            <div style={{ fontSize:11, color:T.textMuted, marginBottom:4 }}>備註</div>
+            <div style={{ fontSize:13, color:T.text, lineHeight:1.7 }}>{p.notes}</div>
+          </div>}
+          <div style={{ display:"flex", gap:10 }}>
+            {!manuallyClosed&&<button onClick={onEdit} style={{ flex:1, padding:13, borderRadius:10, background:`linear-gradient(135deg,${T.primary},${T.primaryLight})`, color:"#fff", border:"none", fontSize:15, fontWeight:700, cursor:"pointer" }}>✏️ 編輯</button>}
+            {manuallyClosed
+              ?<button onClick={onReopen} style={{ flex:1, padding:13, borderRadius:10, background:"#fff", color:T.primary, border:`1.5px solid ${T.primary}`, fontSize:15, fontWeight:700, cursor:"pointer" }}>🔄 重新開案</button>
+              :<button onClick={onClose}  style={{ flex:1, padding:13, borderRadius:10, background:"#fff", color:"#777", border:"1.5px solid #ccc", fontSize:15, fontWeight:700, cursor:"pointer" }}>📁 結案</button>
+            }
+            <button onClick={onDelete} style={{ padding:"13px 18px", borderRadius:10, background:"#fff", color:T.danger, border:`1.5px solid ${T.danger}`, fontSize:15, cursor:"pointer" }}>🗑️</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// 表單
+function PatientForm({ initial, busy, onSave, onCancel }) {
+  const today=new Date().toISOString().split("T")[0];
+  const [f,setF]=useState({
+    id:initial?.id||"", chartNo:initial?.chartNo||"", name:initial?.name||"",
+    phone:initial?.phone||"", address:initial?.address||"", contact:initial?.contact||"",
+    contactPhone:initial?.contactPhone||"", team:initial?.team||"",
+    referral:initial?.referral||"", clinic:initial?.clinic||"", diagnosis:initial?.diagnosis||"",
+    admitDate:initial?.admitDate||today, closeDate:initial?.closeDate||"", notes:initial?.notes||"",
+  });
+  const [err,setErr]=useState({});
+  const set=(k,v)=>{setF(p=>({...p,[k]:v}));setErr(e=>({...e,[k]:""}));};
+  const autoClose=addDays(f.admitDate,365);
+  const validate=()=>{
+    const e={};
+    if(!f.name.trim()) e.name="請填寫姓名";
+    if(!f.admitDate) e.admitDate="請填寫收案日期";
+    setErr(e); return Object.keys(e).length===0;
+  };
+  const submit=()=>{ if(validate()) onSave({...f,closeDate:f.closeDate||autoClose}); };
+  return (
+    <div style={{ animation:"fadeIn .25s ease" }}>
+      <button onClick={onCancel} style={{ background:"none", border:"none", color:T.primary, fontSize:14, cursor:"pointer", marginBottom:14, fontWeight:600, padding:0 }}>← 取消</button>
+      <div style={{ background:"#fff", borderRadius:16, padding:22, boxShadow:"0 2px 16px rgba(0,0,0,0.09)" }}>
+        <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:20, paddingBottom:14, borderBottom:`1px solid ${T.border}` }}>
+          <div style={{ width:36, height:36, background:T.primary, borderRadius:9, display:"flex", alignItems:"center", justifyContent:"center", fontSize:18 }}>{initial?"✏️":"➕"}</div>
+          <h2 style={{ fontSize:17, color:T.text }}>{initial?"編輯個案":"新增個案"}</h2>
+        </div>
+        <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:14, marginBottom:18 }}>
+          <FormField label="姓名" required hasErr={!!err.name} errMsg={err.name}>
+            <input style={inpStyle(err.name)} value={f.name} onChange={e=>set("name",e.target.value)} placeholder="個案姓名" />
+          </FormField>
+          <FormField label="病歷號">
+            <input style={inpStyle()} value={f.chartNo} onChange={e=>set("chartNo",e.target.value)} placeholder="病歷號碼" />
+          </FormField>
+          <FormField label="電話">
+            <input style={inpStyle()} value={f.phone} onChange={e=>set("phone",e.target.value)} placeholder="聯絡電話" type="tel" />
+          </FormField>
+          <FormField label="收案團隊">
+            <input style={inpStyle()} value={f.team} onChange={e=>set("team",e.target.value)} placeholder="例：A 團隊" />
+          </FormField>
+          <FormField label="住址" full>
+            <input style={inpStyle()} value={f.address} onChange={e=>set("address",e.target.value)} placeholder="完整住址" />
+          </FormField>
+          <FormField label="緊急聯絡人">
+            <input style={inpStyle()} value={f.contact} onChange={e=>set("contact",e.target.value)} placeholder="聯絡人姓名" />
+          </FormField>
+          <FormField label="聯絡人電話">
+            <input style={inpStyle()} value={f.contactPhone} onChange={e=>set("contactPhone",e.target.value)} placeholder="聯絡人電話" type="tel" />
+          </FormField>
+          <FormField label="轉介單位">
+            <input style={inpStyle()} value={f.referral} onChange={e=>set("referral",e.target.value)} placeholder="轉介單位名稱" />
+          </FormField>
+          <FormField label="西醫診所">
+            <input style={inpStyle()} value={f.clinic} onChange={e=>set("clinic",e.target.value)} placeholder="西醫診所名稱" />
+          </FormField>
+          <FormField label="主要病症" full>
+            <input style={inpStyle()} value={f.diagnosis} onChange={e=>set("diagnosis",e.target.value)} placeholder="例：腦中風後遺症、骨折術後..." />
+          </FormField>
+          <FormField label="收案日期" required hasErr={!!err.admitDate} errMsg={err.admitDate}>
+            <input style={inpStyle(err.admitDate)} type="date" value={f.admitDate} onChange={e=>set("admitDate",e.target.value)} />
+          </FormField>
+          <FormField label={`結案日期（留空自動 +365 天 = ${fmt(autoClose)}）`} full>
+            <input style={inpStyle()} type="date" value={f.closeDate} onChange={e=>set("closeDate",e.target.value)} />
+          </FormField>
+          <FormField label="備註" full>
+            <textarea style={{...inpStyle(),minHeight:76,resize:"vertical"}} value={f.notes} onChange={e=>set("notes",e.target.value)} placeholder="其他備註事項" />
+          </FormField>
+        </div>
+        <div style={{ display:"flex", gap:10 }}>
+          <button onClick={submit} disabled={busy} style={{ flex:1, padding:14, borderRadius:10, background:busy?"#ccc":`linear-gradient(135deg,${T.primary},${T.primaryLight})`, color:"#fff", border:"none", fontSize:16, fontWeight:700, cursor:busy?"not-allowed":"pointer", boxShadow:busy?"none":"0 3px 12px rgba(45,106,79,0.3)" }}>{busy?"儲存中...":"💾 儲存個案"}</button>
+          <button onClick={onCancel} style={{ padding:"14px 20px", borderRadius:10, background:"#fff", border:`1.5px solid ${T.border}`, fontSize:14, cursor:"pointer" }}>取消</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
