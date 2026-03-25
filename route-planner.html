@@ -715,4 +715,78 @@ function ResultView({ result, doctor, docColor, activeDay, setActiveDay, getMaps
             {dayResult.route.map((stop,i)=>(
               <TimelineItem key={stop.patient.id} icon={`${i+1}`} isNum color={docColor}
                 label={stop.patient.name}
-                sub={[stop.patient.chartNo&&`#${stop.patient.chartNo}`,stop.patient.diagnosis].
+                sub={[stop.patient.chartNo&&`#${stop.patient.chartNo}`,stop.patient.diagnosis].filter(Boolean).join(" ｜ ")}
+                address={stop.patient.address}
+                travel={stop.travel} arrival={minsToTime(stop.arrival)}
+                start={minsToTime(stop.start)} finish={minsToTime(stop.finish)}
+                visitMins={stop.finish-stop.start} wait={stop.start-stop.arrival}/>
+            ))}
+            <TimelineItem icon="🏁" label="結束地點" address={dayResult.daySettings?.endAddress||dayResult.daySettings?.startAddress||""} time={minsToTime(dayResult.route[dayResult.route.length-1].finish+5)} isEnd color={docColor}/>
+          </>
+        )}
+      </div>
+
+      {/* 排不進去 */}
+      {dayResult.unscheduled?.length>0&&(
+        <div style={{background:"#FFF3E0",borderRadius:12,padding:14,marginBottom:12,border:"1px solid #FFB74D"}}>
+          <h3 style={{fontSize:13,color:T.warning,marginBottom:8}}>⚠️ {DAYS[DAY_KEYS.indexOf(activeDay)]}排不進去的患者</h3>
+          {dayResult.unscheduled.map(({patient:p,reason},i)=>(
+            <div key={i} style={{fontSize:13,padding:"4px 0",borderBottom:"1px solid #FFE0B2",display:"flex",justifyContent:"space-between"}}>
+              <span><strong>{p.name}</strong>{p.chartNo&&` (#${p.chartNo})`}</span>
+              <span style={{fontSize:12,color:T.warning}}>{reason}</span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* 本週總計 */}
+      <div style={{background:T.card,borderRadius:12,padding:14}}>
+        <h3 style={{fontSize:13,color:T.primary,marginBottom:10}}>📊 本週總計（{doctor}）</h3>
+        <div style={{display:"grid",gridTemplateColumns:"repeat(5,1fr)",gap:7,marginBottom:totalUnscheduled>0?10:0}}>
+          {DAY_KEYS.map((dk,i)=>{
+            const r=result[dk]||{route:[],unscheduled:[]};
+            return <div key={dk} onClick={()=>setActiveDay(dk)} style={{background:activeDay===dk?"#E3F2FD":r.skipped?"#F5F5F5":"#FAFAFA",borderRadius:9,padding:"8px 4px",textAlign:"center",cursor:"pointer",border:`1.5px solid ${activeDay===dk?docColor:"#E0E0E0"}`}}>
+              <div style={{fontSize:11,color:T.textMuted}}>{DAYS[i]}</div>
+              <div style={{fontSize:18,fontWeight:700,color:r.skipped?"#BDBDBD":docColor}}>{r.skipped?"—":r.route.length}</div>
+              {r.unscheduled?.length>0&&<div style={{fontSize:10,color:T.warning}}>+{r.unscheduled.length}未排</div>}
+            </div>;
+          })}
+        </div>
+        {totalUnscheduled>0&&<div style={{fontSize:12,color:T.warning,padding:"7px 10px",background:"#FFF8E1",borderRadius:7}}>⚠️ 本週共 {totalUnscheduled} 位患者未能排入</div>}
+      </div>
+    </div>
+  );
+}
+
+function TimelineItem({ icon, isNum, label, sub, address, travel, arrival, start, finish, visitMins, wait, time, isStart, isEnd, color }) {
+  const c = color||T.primary;
+  return (
+    <div style={{display:"flex",gap:10,marginBottom:10}}>
+      <div style={{flexShrink:0,display:"flex",flexDirection:"column",alignItems:"center"}}>
+        <div style={{width:30,height:30,borderRadius:"50%",background:isStart||isEnd?"#E8F5E9":c,color:isStart||isEnd?T.success:"#fff",display:"flex",alignItems:"center",justifyContent:"center",fontSize:isNum?12:15,fontWeight:700,boxShadow:"0 2px 6px rgba(0,0,0,.12)"}}>{icon}</div>
+        {!isEnd&&<div style={{width:2,flex:1,background:T.border,marginTop:3,minHeight:16}}/>}
+      </div>
+      <div style={{flex:1,paddingBottom:6}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
+          <div>
+            <div style={{fontSize:13,fontWeight:700,color:isStart||isEnd?T.success:T.text}}>{label}</div>
+            {sub&&<div style={{fontSize:11,color:T.textMuted,marginTop:1}}>{sub}</div>}
+            {address&&<div style={{fontSize:11,color:T.textMuted,marginTop:1}}>📍 {address}</div>}
+          </div>
+          <div style={{textAlign:"right",flexShrink:0}}>
+            {time&&<div style={{fontSize:13,fontWeight:700,color:c}}>{time}</div>}
+            {start&&<div style={{fontSize:13,fontWeight:700,color:c}}>{start} – {finish}</div>}
+            {visitMins&&<div style={{fontSize:11,color:T.textMuted}}>看診 {visitMins} 分</div>}
+          </div>
+        </div>
+        {travel>0&&<div style={{fontSize:11,color:T.textMuted,marginTop:3,display:"flex",gap:8}}>
+          <span>🚗 車程約 {travel} 分</span>
+          {wait>0&&<span>⏳ 等候 {wait} 分</span>}
+        </div>}
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script></body></html>
