@@ -46,12 +46,355 @@ const daysUntil = ds => { if(!ds) return null; const t=new Date(); t.setHours(0,
 const fmt = ds => { if(!ds) return "—"; const [y,m,d]=ds.split("-"); return `${y}/${m}/${d}`; };
 const genId = () => "P"+Date.now().toString().slice(-8)+Math.random().toString(36).slice(2,5);
 const LOCAL_KEY = "home_visit_v2";
-const loadLocal = () => { try { return JSON.parse(localStorage.getItem(LOCAL_KEY)||"[]"); } catch { return []; } };
-const saveLocal = d => localStorage.setItem(LOCAL_KEY, JSON.stringify(d));
-const GAS_KEY = "gas_url_v2";
 const GMAPS_KEY = "gmaps_api_key";
+const GAS_KEY = "gas_url_v2";
+
+// 安全讀寫 LocalStorage (防無痕模式崩潰)
+const loadLocal = () => { try { return JSON.parse(localStorage.getItem(LOCAL_KEY)||"[]"); } catch(e) { return []; } };
+const saveLocal = d => { try { localStorage.setItem(LOCAL_KEY, JSON.stringify(d)); } catch(e){} };
 
 const FIELD_MAP = [
   { key:"name",         patterns:["病患姓名","姓名","名字","name"] },
   { key:"chartNo",      patterns:["掛號證","病歷號","病歷證","chart"] },
   { key:"phone",        patterns:["電話","phone","tel"] },
+  { key:"address",      patterns:["住址","地址","address"] },
+  { key:"contactPhone", patterns:["聯絡人電話"] },
+  { key:"contact",      patterns:["聯絡人"] },
+  { key:"team",         patterns:["團隊"] },
+  { key:"referral",     patterns:["轉介"] },
+  { key:"clinic",       patterns:["診所","西醫"] },
+  { key:"diagnosis",    patterns:["病名","病症","診斷"] },
+  { key:"admitDate",    patterns:["收案日","入案日","收案日期","入案日期"] },
+  { key:"closeDate",    patterns:["結案日","結案日期"] },
+];
+function matchField(header) {
+  const h=(header||"").toLowerCase();
+  for (const f of FIELD_MAP) {
+    if (f.patterns.some(p=>h.includes(p.toLowerCase()))) return f.key;
+  }
+  return null;
+}
+
+function convertROCDate(val) {
+  if (!val) return "";
+  const s = String(val).trim();
+  const m = s.match(/^(\d{2,3})[\/\-](\d{1,2})[\/\-](\d{1,2})$/);
+  if (m) {
+    const y = parseInt(m[1]) + 1911;
+    const mo = m[2].padStart(2,"0");
+    const d  = m[3].padStart(2,"0");
+    return `${y}-${mo}-${d}`;
+  }
+  const m2 = s.match(/^(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})$/);
+  if (m2) return `${m2[1]}-${m2[2].padStart(2,"0")}-${m2[3].padStart(2,"0")}`;
+  return s;
+}
+
+function FormField({ label, full, required, hasErr, errMsg, children }) {
+  return (
+    <div style={{ gridColumn: full?"1 / -1":"auto" }}>
+      <label style={{ display:"block", fontSize:12, color:hasErr?T.danger:T.textMuted, marginBottom:4, fontWeight:600 }}>
+        {label}{required && <span style={{ color:T.danger }}> *</span>}
+      </label>
+      {children}
+      {hasErr && <div style={{ fontSize:11, color:T.danger, marginTop:3 }}>{errMsg}</div>}
+    </div>
+  );
+}
+const inpStyle = hasErr => ({
+  width:"100%", padding:"10px 12px", borderRadius:8,
+  border:`1.5px solid ${hasErr?T.danger:T.border}`,
+  fontSize:14, background:"#fff", color:T.text,
+});
+
+function Dialog({ children, onClose, wide }) {
+  return (
+    <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.55)", display:"flex", alignItems:"center", justifyContent:"center", zIndex:200, padding:16 }}>
+      <div style={{ background:"#fff", borderRadius:18, padding:26, maxWidth:wide?480:300, width:"100%", textAlign:"center", boxShadow:"0 8px 32px rgba(0,0,0,0.2)", maxHeight:"90vh", overflowY:"auto" }}>
+        {children}
+      </div>
+    </div>
+  );
+}
+
+// ════════════ 路線規劃模組 ════════════
+function RoutePlanner({ patients, pushToast }) {
+  const [apiKey, setApiKey] = useState(() => { try { return localStorage.getItem(GMAPS_KEY) || ""; } catch(e){ return ""; } });
+  const [startLoc, setStartLoc] = useState("高雄市");
+  const [startTime, setStartTime] = useState("09:00");
+  const [bufferTime, setBufferTime] = useState(5);
+  const [lunchStart, setLunchStart] = useState("12:00");
+  const [lunchEnd, setLunchEnd] = useState("13:30");
+  const [targetDate, setTargetDate] = useState(new Date().toISOString().split("T")[0]);
+  const [selectedIds, setSelectedIds] = useState(new Set());
+  const [routeResults, setRouteResults] = useState(null);
+  const [calculating, setCalculating] = useState(false);
+  const [draggedIdx, setDraggedIdx] = useState(null);
+
+  const dayOfWeek = targetDate ? new Date(targetDate).getDay() : 1;
+  const dayMap = ["日", "一", "二", "三", "四", "五", "六"];
+  const targetDayStr = dayMap[dayOfWeek];
+
+  const availablePatients = patients.filter(p => {
+    if (p.closedAt || daysUntil(p.closeDate) < 0) return false;
+    if (!p.availDays || p.availDays.length === 0) return true; 
+    return p.availDays.includes(targetDayStr);
+  });
+
+  const toggleSelect = id => {
+    setSelectedIds(prev => {
+      const s = new Set(prev);
+      s.has(id) ? s.delete(id) : s.add(id);
+      return s;
+    });
+  };
+
+  const loadGoogleMaps = () => {
+    return new Promise((resolve, reject) => {
+      if (window.google && window.google.maps) return resolve();
+      const script = document.createElement("script");
+      script.src = `https://maps.googleapis.com/maps/api/js?key=${apiKey}`;
+      script.async = true;
+      script.defer = true;
+      script.onload = resolve;
+      script.onerror = reject;
+      document.head.appendChild(script);
+    });
+  };
+
+  const calculateRoute = async (orderedPatients) => {
+    if (!apiKey) return pushToast("⚠️ 請先輸入 Google Maps API 金鑰", "danger");
+    if (orderedPatients.length === 0) return pushToast("⚠️ 請至少選擇一位病患", "danger");
+    
+    setCalculating(true);
+    try { localStorage.setItem(GMAPS_KEY, apiKey); } catch(e){}
+
+    try {
+      await loadGoogleMaps();
+      const service = new window.google.maps.DistanceMatrixService();
+      
+      const waypoints = [startLoc, ...orderedPatients.map(p => p.address)];
+      const request = {
+        origins: waypoints.slice(0, -1),
+        destinations: waypoints.slice(1),
+        travelMode: 'DRIVING',
+      };
+
+      service.getDistanceMatrix(request, (response, status) => {
+        if (status !== 'OK') {
+          pushToast(`❌ 距離計算失敗: ${status}`, "danger");
+          setCalculating(false);
+          return;
+        }
+
+        let results = [];
+        let currentTime = new Date(`1970/01/01 ${startTime}`);
+        const lunchS = new Date(`1970/01/01 ${lunchStart}`);
+        const lunchE = new Date(`1970/01/01 ${lunchEnd}`);
+
+        for (let i = 0; i < orderedPatients.length; i++) {
+          let travelInfo = response.rows[i].elements[i];
+          if (travelInfo.status !== 'OK') {
+            results.push({ ...orderedPatients[i], error: "無法計算地址" });
+            continue;
+          }
+
+          let travelMins = Math.ceil(travelInfo.duration.value / 60);
+          currentTime.setMinutes(currentTime.getMinutes() + travelMins + Number(bufferTime));
+
+          let isLunch = false;
+          if (currentTime >= lunchS && currentTime < lunchE) {
+             isLunch = true;
+             currentTime = new Date(`1970/01/01 ${lunchEnd}`);
+             currentTime.setMinutes(currentTime.getMinutes() + travelMins); 
+          }
+
+          let arrivalTimeStr = currentTime.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
+          let duration = (orderedPatients[i] && orderedPatients[i].duration) ? Number(orderedPatients[i].duration) : 25;
+          currentTime.setMinutes(currentTime.getMinutes() + duration);
+          let finishTimeStr = currentTime.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
+
+          results.push({
+            ...orderedPatients[i],
+            travelMins, arrivalTimeStr, finishTimeStr, isLunch, calcDuration: duration
+          });
+        }
+        setRouteResults(results);
+        setCalculating(false);
+        pushToast("✅ 路線計算完成");
+      });
+    } catch (err) {
+      pushToast("❌ Google Maps 載入失敗，請檢查金鑰", "danger");
+      setCalculating(false);
+    }
+  };
+
+  const handleStartRouting = () => {
+    const selectedList = availablePatients.filter(p => selectedIds.has(p.id));
+    calculateRoute(selectedList);
+  };
+
+  const handleDragStart = (e, idx) => setDraggedIdx(idx);
+  const handleDragOver = e => e.preventDefault();
+  const handleDrop = (e, idx) => {
+    e.preventDefault();
+    if (draggedIdx === null || draggedIdx === idx) return;
+    const newList = [...routeResults];
+    const [movedItem] = newList.splice(draggedIdx, 1);
+    newList.splice(idx, 0, movedItem);
+    calculateRoute(newList);
+    setDraggedIdx(null);
+  };
+
+  return (
+    <div style={{ animation:"fadeIn .3s ease" }}>
+      <div style={{ background:"#fff", borderRadius:16, padding:18, marginBottom:16, boxShadow:"0 2px 12px rgba(0,0,0,0.05)" }}>
+        <h3 style={{ fontSize:16, marginBottom:14, color:T.primaryDark, display:'flex', alignItems:'center', gap:6 }}>⚙️ 排程設定</h3>
+        <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:12, marginBottom:12 }}>
+          <FormField label="Google Maps 金鑰" full>
+            <input type="password" style={inpStyle()} value={apiKey} onChange={e=>setApiKey(e.target.value)} placeholder="AIzaSy..." />
+          </FormField>
+          <FormField label="出發日期">
+            <input type="date" style={inpStyle()} value={targetDate} onChange={e=>setTargetDate(e.target.value)} />
+          </FormField>
+          <FormField label="出發地點">
+            <input type="text" style={inpStyle()} value={startLoc} onChange={e=>setStartLoc(e.target.value)} />
+          </FormField>
+          <FormField label="出發時間">
+            <input type="time" style={inpStyle()} value={startTime} onChange={e=>setStartTime(e.target.value)} />
+          </FormField>
+          <FormField label="站間緩衝(分)">
+            <input type="number" style={inpStyle()} value={bufferTime} onChange={e=>setBufferTime(e.target.value)} />
+          </FormField>
+          <FormField label="午休起">
+            <input type="time" style={inpStyle()} value={lunchStart} onChange={e=>setLunchStart(e.target.value)} />
+          </FormField>
+          <FormField label="午休迄">
+            <input type="time" style={inpStyle()} value={lunchEnd} onChange={e=>setLunchEnd(e.target.value)} />
+          </FormField>
+        </div>
+      </div>
+
+      {!routeResults && (
+        <div style={{ background:"#fff", borderRadius:16, padding:18, boxShadow:"0 2px 12px rgba(0,0,0,0.05)" }}>
+          <h3 style={{ fontSize:16, marginBottom:10, color:T.text }}>請勾選 {targetDate} (週{targetDayStr}) 預計訪視名單</h3>
+          <div style={{ maxHeight:250, overflowY:'auto', marginBottom:14, border:`1px solid ${T.border}`, borderRadius:8, padding:8 }}>
+            {availablePatients.length === 0 ? <div style={{padding:10, color:T.textMuted, textAlign:'center'}}>當日無可排程個案</div> :
+              availablePatients.map(p => (
+              <div key={p.id} onClick={()=>toggleSelect(p.id)} style={{ display:'flex', alignItems:'center', padding:10, borderBottom:`1px solid ${T.border}`, cursor:'pointer', background:selectedIds.has(p.id)?'#EAF4EE':'#fff' }}>
+                <input type="checkbox" className="chk" checked={selectedIds.has(p.id)} readOnly style={{ marginRight:10 }} />
+                <div>
+                  <div style={{ fontWeight:700 }}>{p.name} <span style={{fontSize:12, color:T.textMuted, fontWeight:400}}>({p.duration||25}分)</span></div>
+                  <div style={{ fontSize:12, color:T.textMuted }}>{p.address}</div>
+                </div>
+              </div>
+            ))}
+          </div>
+          <button onClick={handleStartRouting} disabled={calculating || selectedIds.size===0} style={{ width:"100%", padding:14, borderRadius:10, background:calculating?"#ccc":`linear-gradient(135deg,${T.primary},${T.primaryLight})`, color:"#fff", border:"none", fontSize:16, fontWeight:700, cursor:calculating?"not-allowed":"pointer" }}>{calculating ? "計算中..." : "🚀 開始規劃路線"}</button>
+        </div>
+      )}
+
+      {routeResults && (
+        <div style={{ background:"#fff", borderRadius:16, padding:18, boxShadow:"0 2px 12px rgba(0,0,0,0.05)" }}>
+          <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:10 }}>
+            <h3 style={{ fontSize:16, color:T.primaryDark }}>📍 每日時間軸</h3>
+            <button onClick={()=>setRouteResults(null)} style={{ background:"none", border:"none", color:T.textMuted, cursor:"pointer", textDecoration:"underline" }}>重新選擇</button>
+          </div>
+          <p style={{ fontSize: 12, color: T.danger, marginBottom: 12, fontWeight:700 }}>💡 提示：按住卡片可上下拖曳微調順序，系統會自動重算時間。</p>
+          
+          <div style={{ background: "#e9ecef", marginBottom: 8, padding: 10, borderRadius: 8 }}>
+            <strong>🏁 出發地：{startLoc}</strong> <br/>
+            <span style={{fontSize:13, color:T.textMuted}}>🕒 出發時間：{startTime}</span>
+          </div>
+
+          {routeResults.map((p, idx) => (
+            <div key={p.id}>
+              {p.isLunch && (
+                <div style={{ background: "#ffeeba", marginBottom: 8, padding: 10, borderRadius: 8, textAlign: "center", color:"#856404" }}>
+                  <strong>🍱 午休時間</strong> ({lunchStart} - {lunchEnd})
+                </div>
+              )}
+              <div 
+                draggable
+                onDragStart={e => handleDragStart(e, idx)}
+                onDragOver={handleDragOver}
+                onDrop={e => handleDrop(e, idx)}
+                style={{ background: "#fff", border: `2px solid ${T.primaryLight}`, marginBottom: 8, padding: 12, borderRadius: 8, cursor: "grab", boxShadow:"0 2px 4px rgba(0,0,0,0.05)" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+                  <div>
+                    <div style={{ fontSize:15, fontWeight:700 }}>{idx+1}. {p.name} <span style={{fontSize:12, fontWeight:400, color:T.textMuted}}>({p.calcDuration}分)</span></div>
+                    {p.error ? <div style={{ color:T.danger, fontSize:13 }}>{p.error}</div> : (
+                      <React.Fragment>
+                        <div style={{ fontSize:13, color:T.textMuted, margin:"4px 0" }}>🚗 車程約 {p.travelMins} 分鐘</div>
+                        <div style={{ fontSize:14 }}>🕒 抵達: <span style={{ color:T.danger, fontWeight:700 }}>{p.arrivalTimeStr}</span> ~ {p.finishTimeStr}</div>
+                      </React.Fragment>
+                    )}
+                    <div style={{ fontSize:12, color:T.textMuted, marginTop:4 }}>🏠 {p.address}</div>
+                  </div>
+                  <a href={`https://www.google.com/maps/dir/?api=1&origin=${encodeURIComponent(idx===0?startLoc:routeResults[idx-1].address)}&destination=${encodeURIComponent(p.address)}&travelmode=driving`} target="_blank" style={{ background: T.primary, color: "white", padding: "6px 12px", textDecoration: "none", borderRadius: 6, fontSize: 13, fontWeight:700 }}>導航</a>
+                </div>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ════════════ 主程式 App ════════════
+function App() {
+  const [patients, setPatients]   = useState([]);
+  const [view, setView]           = useState("list"); 
+  const [editing, setEditing]     = useState(null);
+  const [search, setSearch]       = useState("");
+  const [sortBy, setSortBy]       = useState("chartNo");
+  const [onlyAlert, setOnlyAlert] = useState(false);
+  const [toast, setToast]         = useState(null);
+  const [busy, setBusy]           = useState(false);
+  const [delTarget, setDelTarget] = useState(null);
+  
+  const [gasUrl, setGasUrl]       = useState(()=>{ try{ return localStorage.getItem(GAS_KEY)||""; }catch(e){ return ""; } });
+  const [gasDraft, setGasDraft]   = useState(()=>{ try{ return localStorage.getItem(GAS_KEY)||""; }catch(e){ return ""; } });
+  
+  const [showSettings, setShowSettings] = useState(false);
+  const [selectMode, setSelectMode]     = useState(false);
+  const [selected, setSelected]         = useState(new Set());
+  const [confirmBulkDel, setConfirmBulkDel] = useState(false);
+  const [importResult, setImportResult] = useState(null);
+  const fileRef = useRef();
+
+  useEffect(() => { setPatients(loadLocal()); }, []);
+  useEffect(() => { if(!toast) return; const t=setTimeout(()=>setToast(null),3500); return ()=>clearTimeout(t); }, [toast]);
+
+  const pushToast = (msg,type="ok") => setToast({msg,type});
+  const syncGAS = useCallback(async (action,payload) => {
+    let url = "";
+    try { url = localStorage.getItem(GAS_KEY); } catch(e){}
+    if(!url) return;
+    try { await fetch(url,{method:"POST",mode:"no-cors",headers:{"Content-Type":"application/json"},body:JSON.stringify({action,...payload})}); }
+    catch(e){console.warn(e);}
+  },[]);
+  const persist = list => { setPatients(list); saveLocal(list); };
+
+  const savePatient = data => {
+    setBusy(true);
+    const isNew=!data.id;
+    const rec={...data, id:data.id||genId(), closeDate:data.closeDate||addDays(data.admitDate,365)};
+    persist(isNew?[...patients,rec]:patients.map(p=>p.id===rec.id?rec:p));
+    syncGAS(isNew?"create":"update",{patient:rec});
+    pushToast(isNew?`✅ 已新增：${rec.name}`:`✅ 已更新：${rec.name}`);
+    setView("list"); setEditing(null); setBusy(false);
+  };
+
+  const deletePatient = id => {
+    const p=patients.find(x=>x.id===id);
+    persist(patients.filter(x=>x.id!==id));
+    syncGAS("delete",{patientId:id});
+    pushToast(`🗑️ 已刪除：${p?.name}`,"danger");
+    setDelTarget(null); setView("list"); setEditing(null);
+  };
+
+  const bulkDelete = () => {
+    const ids=[...selected];
+    persist(patients.filter(p=>!ids.includes(p.
