@@ -57,6 +57,7 @@ const FIELD_MAP = [
   { key:"contactPhone", patterns:["聯絡人電話"] },
   { key:"contact",      patterns:["聯絡人"] },
   { key:"team",         patterns:["團隊"] },
+  { key:"doctor",       patterns:["醫師","醫生","doctor","主治"] },
   { key:"referral",     patterns:["轉介"] },
   { key:"clinic",       patterns:["診所","西醫"] },
   { key:"diagnosis",    patterns:["病名","病症","診斷"] },
@@ -468,6 +469,7 @@ function PatientCard({ p, onClick, selectMode, selected, onToggle }) {
             <div style={{ fontSize:12, color:T.textMuted, display:"flex", gap:12, flexWrap:"wrap" }}>
               {p.chartNo&&<span>📋 {p.chartNo}</span>}
               {p.phone&&<span>📞 {p.phone}</span>}
+              {p.doctor&&<span>👨‍⚕️ {p.doctor}</span>}
               {p.team&&<span>👥 {p.team}</span>}
               {p.diagnosis&&<span>🩺 {p.diagnosis}</span>}
             </div>
@@ -491,8 +493,9 @@ function PatientDetail({ p, onEdit, onDelete, onClose, onReopen, onBack }) {
     ["病歷號",p.chartNo],["電話",p.phone],
     ["住址",p.address,true],
     ["緊急聯絡人",p.contact],["聯絡人電話",p.contactPhone],
-    ["收案團隊",p.team],["轉介單位",p.referral],
-    ["西醫診所",p.clinic],["主要病症",p.diagnosis],
+    ["收案團隊",p.team],["負責醫師",p.doctor],
+    ["轉介單位",p.referral],["西醫診所",p.clinic],
+    ["主要病症",p.diagnosis],
     ["收案日期",fmt(p.admitDate)],["結案日期",fmt(p.closeDate)],
   ];
   return (
@@ -549,6 +552,7 @@ function PatientForm({ initial, busy, onSave, onCancel }) {
     id:initial?.id||"", chartNo:initial?.chartNo||"", name:initial?.name||"",
     phone:initial?.phone||"", address:initial?.address||"", contact:initial?.contact||"",
     contactPhone:initial?.contactPhone||"", team:initial?.team||"",
+    doctor:initial?.doctor||"",
     referral:initial?.referral||"", clinic:initial?.clinic||"", diagnosis:initial?.diagnosis||"",
     admitDate:initial?.admitDate||today, closeDate:initial?.closeDate||"", notes:initial?.notes||"",
   });
@@ -582,6 +586,9 @@ function PatientForm({ initial, busy, onSave, onCancel }) {
           </FormField>
           <FormField label="收案團隊">
             <input style={inpStyle()} value={f.team} onChange={e=>set("team",e.target.value)} placeholder="例：A 團隊" />
+          </FormField>
+          <FormField label="負責醫師">
+            <input style={inpStyle()} value={f.doctor} onChange={e=>set("doctor",e.target.value)} placeholder="例：葉星沅" />
           </FormField>
           <FormField label="住址" full>
             <input style={inpStyle()} value={f.address} onChange={e=>set("address",e.target.value)} placeholder="完整住址" />
