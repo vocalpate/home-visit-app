@@ -50,8 +50,8 @@ const GAS_KEY = "gas_url_v2";
 
 // Excel 欄位自動對應
 const FIELD_MAP = [
-  { key:"name",         patterns:["姓名","名字","name"] },
-  { key:"chartNo",      patterns:["病歷","chart"] },
+  { key:"name",         patterns:["病患姓名","姓名","名字","name"] },
+  { key:"chartNo",      patterns:["掛號證","病歷","chart"] },
   { key:"phone",        patterns:["電話","phone","tel"] },
   { key:"address",      patterns:["住址","地址","address"] },
   { key:"contactPhone", patterns:["聯絡人電話"] },
@@ -60,8 +60,9 @@ const FIELD_MAP = [
   { key:"referral",     patterns:["轉介"] },
   { key:"clinic",       patterns:["診所","西醫"] },
   { key:"diagnosis",    patterns:["病名","病症","診斷"] },
-  { key:"admitDate",    patterns:["收案","入案"] },
-  { key:"closeDate",    patterns:["結案"] },
+  { key:"admitDate",    patterns:["收案日","入案日","收案日期","入案日期"] },
+  { key:"closeDate",    patterns:["結案日","結案日期"] },
+  // 門診日期不匯入（不等於收案日期）
 ];
 function matchField(header) {
   const h=(header||"").toLowerCase();
@@ -69,6 +70,24 @@ function matchField(header) {
     if (f.patterns.some(p=>h.includes(p.toLowerCase()))) return f.key;
   }
   return null;
+}
+
+// 民國年轉西元：115/01/01 → 2026-01-01
+function convertROCDate(val) {
+  if (!val) return "";
+  const s = String(val).trim();
+  // 格式：NNN/MM/DD 或 NNN-MM-DD
+  const m = s.match(/^(\d{2,3})[\/\-](\d{1,2})[\/\-](\d{1,2})$/);
+  if (m) {
+    const y = parseInt(m[1]) + 1911;
+    const mo = m[2].padStart(2,"0");
+    const d  = m[3].padStart(2,"0");
+    return `${y}-${mo}-${d}`;
+  }
+  // 已是西元格式 YYYY-MM-DD 或 YYYY/MM/DD
+  const m2 = s.match(/^(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})$/);
+  if (m2) return `${m2[1]}-${m2[2].padStart(2,"0")}-${m2[3].padStart(2,"0")}`;
+  return s;
 }
 
 // FormField（外部定義避免游標跳動）
@@ -180,17 +199,37 @@ function App() {
         const ws=wb.Sheets[wb.SheetNames[0]];
         const rows=XLSX.utils.sheet_to_json(ws,{header:1,defval:""});
         if(rows.length<2){pushToast("⚠️ Excel 內容為空","danger"); return;}
-        const headers=rows[0].map(h=>String(h).trim());
-        const colMap={};
-        headers.forEach((h,i)=>{ const k=matchField(h); if(k) colMap[i]=k; });
+
+        // 自動偵測標題列：找第一個「能對應到至少2個欄位，且包含姓名或病歷號」的列
+        let headerRowIdx = -1;
+        let colMap = {};
+        for (let ri=0; ri<Math.min(rows.length,10); ri++) {
+          const tryHeaders = rows[ri].map(h=>String(h).trim());
+          const tryMap = {};
+          tryHeaders.forEach((h,i)=>{ const k=matchField(h); if(k) tryMap[i]=k; });
+          const vals = Object.values(tryMap);
+          const hasKey = vals.includes("name") || vals.includes("chartNo");
+          if (Object.keys(tryMap).length >= 2 && hasKey) {
+            headerRowIdx = ri;
+            colMap = tryMap;
+            break;
+          }
+        }
+        if (headerRowIdx < 0) { pushToast("❌ 找不到可對應的標題列（需含姓名或病歷號欄）","danger"); return; }
+
         const existingNames=new Set(patients.map(p=>p.name));
         const seenInFile=new Set();
         const toAdd=[], skippedDup=[], skippedExist=[];
-        for(let r=1;r<rows.length;r++){
+        for(let r=headerRowIdx+1; r<rows.length; r++){
           const row=rows[r];
           if(row.every(c=>!String(c).trim())) continue;
           const rec={};
-          Object.entries(colMap).forEach(([i,k])=>{ rec[k]=String(row[i]||"").trim(); });
+          Object.entries(colMap).forEach(([i,k])=>{
+            let v = String(row[i]||"").trim();
+            // 日期欄位：嘗試轉換民國年
+            if ((k==="admitDate"||k==="closeDate") && v) v = convertROCDate(v);
+            rec[k]=v;
+          });
           const name=rec.name||""; if(!name) continue;
           if(seenInFile.has(name)){skippedDup.push(name); continue;}
           seenInFile.add(name);
