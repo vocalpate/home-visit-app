@@ -184,13 +184,19 @@ function App() {
   const [planning, setPlanning] = useState(false);
   const [result, setResult] = useState(null); // { mon:{ route, unscheduled }, ... }
 
-  // 全域設定
-  const [settings, setSettings] = useState(() => loadLocal("route_settings_v1") || {
-    startAddress: "",
-    endAddress:   "",
-    startTime:    "09:00",
-    endTime:      "18:00",
-    visitMins:    25,
+  // 全域設定：每天獨立設定
+  const defaultDaySettings = () => ({
+    startAddress: "", endAddress: "", startTime: "09:00", endTime: "18:00",
+  });
+  const [settings, setSettings] = useState(() => loadLocal("route_settings_v2") || {
+    visitMins: 25,
+    days: {
+      mon: defaultDaySettings(),
+      tue: defaultDaySettings(),
+      wed: defaultDaySettings(),
+      thu: defaultDaySettings(),
+      fri: defaultDaySettings(),
+    }
   });
 
   useEffect(() => {
@@ -211,7 +217,7 @@ function App() {
 
   const saveSettings = (s) => {
     setSettings(s);
-    saveLocal("route_settings_v1", s);
+    saveLocal("route_settings_v2", s);
   };
 
   const saveSchedule = (pid, data) => {
@@ -230,28 +236,19 @@ function App() {
   // ── 開始規劃 ──────────────────────────────────────────────
   const startPlanning = async () => {
     if (!getApiKey()) { pushToast("⚠️ 請先在設定中填入 Google Maps API 金鑰", "danger"); return; }
-    if (!settings.startAddress) { pushToast("⚠️ 請填寫出發地點", "danger"); return; }
+    const hasAnyDay = DAY_KEYS.some(dk => settings.days[dk]?.startAddress);
+    if (!hasAnyDay) { pushToast("⚠️ 請至少設定一天的出發地點", "danger"); return; }
 
     setPlanning(true);
     pushToast("🗺️ 正在換算地址座標...");
 
     try {
-      // 1. 收集所有需要 geocode 的地址
       const allPatients = patients.filter(p => {
         const s = scheduleData[p.id];
         return s && DAY_KEYS.some(dk => s[dk]?.enabled);
       });
 
-      // 2. Geocode 出發地 & 結束地
-      const startCoord = await geocode(settings.startAddress);
-      if (!startCoord) { pushToast("❌ 無法解析出發地址，請確認地址正確", "danger"); setPlanning(false); return; }
-
-      let endCoord = startCoord;
-      if (settings.endAddress && settings.endAddress !== settings.startAddress) {
-        endCoord = await geocode(settings.endAddress) || startCoord;
-      }
-
-      // 3. Geocode 所有患者地址
+      // Geocode 所有患者地址
       pushToast("🏠 正在換算患者地址...");
       const coords = {};
       for (const p of allPatients) {
@@ -261,22 +258,38 @@ function App() {
         }
       }
 
-      // 4. 每天規劃
+      // 每天獨立 geocode 出發/結束地
       pushToast("📅 正在規劃路線...");
       const res = {};
       for (const dk of DAY_KEYS) {
+        const daySettings = settings.days[dk];
+        if (!daySettings?.startAddress) {
+          res[dk] = { route:[], unscheduled:[], skipped:true };
+          continue;
+        }
+        const startCoord = await geocode(daySettings.startAddress);
+        if (!startCoord) { res[dk] = { route:[], unscheduled:[], error:"無法解析出發地址" }; continue; }
+        let endCoord = startCoord;
+        if (daySettings.endAddress && daySettings.endAddress !== daySettings.startAddress) {
+          endCoord = await geocode(daySettings.endAddress) || startCoord;
+        }
         const dayPatients = patients.filter(p => {
           const s = scheduleData[p.id];
           return s && s[dk]?.enabled && coords[p.id];
         });
-        res[dk] = planDay(dk, dayPatients, coords, startCoord, endCoord, settings);
+        res[dk] = planDay(dk, dayPatients, coords, startCoord, endCoord, {
+          startTime: daySettings.startTime,
+          endTime:   daySettings.endTime,
+          visitMins: settings.visitMins,
+        });
         res[dk].startCoord = startCoord;
         res[dk].endCoord   = endCoord;
+        res[dk].daySettings = daySettings;
       }
 
       setResult(res);
       setView("result");
-      setActiveDay("mon");
+      setActiveDay(DAY_KEYS.find(dk => !res[dk].skipped) || "mon");
       pushToast("✅ 路線規劃完成！");
     } catch (err) {
       console.error(err);
@@ -290,9 +303,10 @@ function App() {
     if (!result || !result[dayKey]) return "#";
     const r = result[dayKey];
     if (r.route.length === 0) return "#";
+    const ds = settings.days[dayKey];
     const waypoints = r.route.map(s => encodeURIComponent(s.patient.address)).join("|");
-    const origin    = encodeURIComponent(settings.startAddress);
-    const dest      = encodeURIComponent(settings.endAddress || r.route[r.route.length-1].patient.address);
+    const origin = encodeURIComponent(ds?.startAddress || "");
+    const dest   = encodeURIComponent(ds?.endAddress || r.route[r.route.length-1].patient.address);
     return `https://www.google.com/maps/dir/?api=1&origin=${origin}&destination=${dest}&waypoints=${waypoints}&travelmode=driving`;
   };
 
@@ -361,6 +375,7 @@ function App() {
 function SetupView({ settings, onSave, patients, scheduleData, onSaveSchedule, onPlan, planning }) {
   const [s, setS] = useState(settings);
   const set = (k,v) => setS(p=>({...p,[k]:v}));
+  const [activeSetupDay, setActiveSetupDay] = useState("mon");
   const [apiKey, setApiKey] = useState(() => localStorage.getItem("gmaps_api_key") || "");
   const [showKey, setShowKey] = useState(false);
   const [keySaved, setKeySaved] = useState(!!localStorage.getItem("gmaps_api_key"));
@@ -416,30 +431,59 @@ function SetupView({ settings, onSave, patients, scheduleData, onSaveSchedule, o
       </div>
 
       <div style={{ background:T.card, borderRadius:16, padding:22, boxShadow:"0 2px 16px rgba(0,0,0,0.08)", marginBottom:14 }}>
-        <h2 style={{ fontSize:16, color:T.primary, marginBottom:16, display:"flex", alignItems:"center", gap:8 }}>
+        <h2 style={{ fontSize:16, color:T.primary, marginBottom:6, display:"flex", alignItems:"center", gap:8 }}>
           <span>⚙️</span> 每日行程設定
         </h2>
-        <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:12 }}>
-          {[["startAddress","出發地點","例：高雄市三民區建工路"],["endAddress","結束地點（留空＝同出發地）","例：高雄市鳳山區光遠路"]].map(([k,lbl,ph])=>(
-            <div key={k} style={{ gridColumn:"1 / -1" }}>
-              <label style={{ fontSize:12, color:T.textMuted, fontWeight:600, display:"block", marginBottom:4 }}>{lbl}</label>
-              <input style={inp} value={s[k]} onChange={e=>set(k,e.target.value)} placeholder={ph} />
-            </div>
-          ))}
-          <div>
-            <label style={{ fontSize:12, color:T.textMuted, fontWeight:600, display:"block", marginBottom:4 }}>出發時間</label>
-            <input style={inp} type="time" value={s.startTime} onChange={e=>set("startTime",e.target.value)} />
-          </div>
-          <div>
-            <label style={{ fontSize:12, color:T.textMuted, fontWeight:600, display:"block", marginBottom:4 }}>結束時間</label>
-            <input style={inp} type="time" value={s.endTime} onChange={e=>set("endTime",e.target.value)} />
-          </div>
-          <div>
-            <label style={{ fontSize:12, color:T.textMuted, fontWeight:600, display:"block", marginBottom:4 }}>預設每次看診時間（分鐘）</label>
-            <input style={inp} type="number" min="10" max="120" value={s.visitMins} onChange={e=>set("visitMins",parseInt(e.target.value)||25)} />
-          </div>
+        <div style={{ fontSize:12, color:T.textMuted, marginBottom:14 }}>每天可設定不同的出發地點、時間。未設定的那天不會排班。</div>
+
+        {/* 預設看診時間（全域）*/}
+        <div style={{ marginBottom:16, paddingBottom:14, borderBottom:`1px solid ${T.border}` }}>
+          <label style={{ fontSize:12, color:T.textMuted, fontWeight:600, display:"block", marginBottom:4 }}>預設每次看診時間（分鐘，各患者可個別調整）</label>
+          <input style={{ ...inp, maxWidth:160 }} type="number" min="10" max="120"
+            value={s.visitMins} onChange={e=>set("visitMins",parseInt(e.target.value)||25)} />
         </div>
-        <button onClick={()=>onSave(s)} style={{ marginTop:14, background:T.primaryLight, color:"#fff", border:"none", borderRadius:9, padding:"10px 20px", fontSize:14, fontWeight:700, cursor:"pointer" }}>💾 儲存設定</button>
+
+        {/* 星期分頁 */}
+        <div style={{ display:"flex", gap:6, marginBottom:14, flexWrap:"wrap" }}>
+          {DAY_KEYS.map((dk,i)=>{
+            const filled = !!(s.days?.[dk]?.startAddress);
+            return (
+              <button key={dk} onClick={()=>setActiveSetupDay(dk)}
+                style={{
+                  padding:"6px 14px", borderRadius:20, border:"none", cursor:"pointer", fontSize:13, fontWeight:600,
+                  background: activeSetupDay===dk ? T.primary : filled ? "#E3F2FD" : "#F5F5F5",
+                  color: activeSetupDay===dk ? "#fff" : filled ? T.primary : "#BDBDBD",
+                  boxShadow: activeSetupDay===dk ? "0 2px 8px rgba(21,101,192,0.3)" : "none",
+                }}>
+                {DAYS[i]}{filled?" ✓":""}
+              </button>
+            );
+          })}
+        </div>
+
+        {/* 當天設定 */}
+        {DAY_KEYS.map(dk => activeSetupDay===dk && (
+          <div key={dk} style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:12 }}>
+            <div style={{ gridColumn:"1 / -1" }}>
+              <label style={{ fontSize:12, color:T.textMuted, fontWeight:600, display:"block", marginBottom:4 }}>出發地點</label>
+              <input style={inp} value={s.days?.[dk]?.startAddress||""} onChange={e=>setS(prev=>({...prev,days:{...prev.days,[dk]:{...prev.days?.[dk],startAddress:e.target.value}}}))} placeholder="例：高雄市三民區建工路123號" />
+            </div>
+            <div style={{ gridColumn:"1 / -1" }}>
+              <label style={{ fontSize:12, color:T.textMuted, fontWeight:600, display:"block", marginBottom:4 }}>結束地點（留空＝同出發地）</label>
+              <input style={inp} value={s.days?.[dk]?.endAddress||""} onChange={e=>setS(prev=>({...prev,days:{...prev.days,[dk]:{...prev.days?.[dk],endAddress:e.target.value}}}))} placeholder="例：高雄市鳳山區光遠路" />
+            </div>
+            <div>
+              <label style={{ fontSize:12, color:T.textMuted, fontWeight:600, display:"block", marginBottom:4 }}>出發時間</label>
+              <input style={inp} type="time" value={s.days?.[dk]?.startTime||"09:00"} onChange={e=>setS(prev=>({...prev,days:{...prev.days,[dk]:{...prev.days?.[dk],startTime:e.target.value}}}))} />
+            </div>
+            <div>
+              <label style={{ fontSize:12, color:T.textMuted, fontWeight:600, display:"block", marginBottom:4 }}>結束時間</label>
+              <input style={inp} type="time" value={s.days?.[dk]?.endTime||"18:00"} onChange={e=>setS(prev=>({...prev,days:{...prev.days,[dk]:{...prev.days?.[dk],endTime:e.target.value}}}))} />
+            </div>
+          </div>
+        ))}
+
+        <button onClick={()=>onSave(s)} style={{ marginTop:16, background:T.primaryLight, color:"#fff", border:"none", borderRadius:9, padding:"10px 20px", fontSize:14, fontWeight:700, cursor:"pointer" }}>💾 儲存設定</button>
       </div>
 
       {/* 狀態摘要 */}
@@ -622,12 +666,14 @@ function ResultView({ result, settings, activeDay, setActiveDay, getMapsUrl }) {
         {dayResult.route.length === 0 ? (
           <div style={{ textAlign:"center", padding:"30px 0", color:T.textMuted }}>
             <div style={{ fontSize:32, marginBottom:8 }}>📭</div>
-            <div style={{ fontSize:14 }}>今日無排程</div>
+            <div style={{ fontSize:14 }}>{dayResult.skipped ? "今日未設定出發地點" : "今日無排程"}</div>
           </div>
         ) : (
           <>
             {/* 出發點 */}
-            <TimelineItem icon="🏠" label="出發地點" address={settings.startAddress} time={settings.startTime} isStart />
+            <TimelineItem icon="🏠" label="出發地點"
+              address={dayResult.daySettings?.startAddress || ""}
+              time={dayResult.daySettings?.startTime || ""} isStart />
 
             {dayResult.route.map((stop, i) => (
               <TimelineItem key={stop.patient.id} icon={`${i+1}`} isNum
@@ -644,7 +690,8 @@ function ResultView({ result, settings, activeDay, setActiveDay, getMapsUrl }) {
             ))}
 
             {/* 結束點 */}
-            <TimelineItem icon="🏁" label="結束地點" address={settings.endAddress||settings.startAddress}
+            <TimelineItem icon="🏁" label="結束地點"
+              address={dayResult.daySettings?.endAddress || dayResult.daySettings?.startAddress || ""}
               time={minsToTime(dayResult.route[dayResult.route.length-1].finish + 5)} isEnd />
           </>
         )}
