@@ -222,6 +222,7 @@ function App() {
           </div>
         </div>
         <div style={{display:"flex",gap:6}}>
+          <a href="index.html" style={{background:"rgba(255,255,255,0.15)",border:"1px solid rgba(255,255,255,0.25)",color:"#fff",borderRadius:8,padding:"5px 10px",fontSize:11,cursor:"pointer",fontWeight:400,textDecoration:"none"}} title="前往個案管理">🏥</a>
           {["setup","schedule","result"].map((v,i)=>(
             <button key={v} onClick={()=>setView(v)} style={{background:view===v?"rgba(255,255,255,0.25)":"rgba(255,255,255,0.08)",border:`1px solid ${view===v?"rgba(255,255,255,0.5)":"rgba(255,255,255,0.2)"}`,color:"#fff",borderRadius:8,padding:"5px 10px",fontSize:11,cursor:"pointer",fontWeight:view===v?700:400}}>
               {["設定","排班","結果"][i]}
@@ -623,14 +624,4 @@ function TimelineItem({ icon, isNum, label, sub, address, travel, arrival, start
             {visitMins&&<div style={{fontSize:11,color:T.textMuted}}>看診 {visitMins} 分</div>}
           </div>
         </div>
-        {travel>0&&<div style={{fontSize:11,color:T.textMuted,marginTop:3,display:"flex",gap:8}}>
-          <span>🚗 車程約 {travel} 分</span>
-          {wait>0&&<span>⏳ 等候 {wait} 分</span>}
-        </div>}
-      </div>
-    </div>
-  );
-}
-
-ReactDOM.createRoot(document.getElementById("root")).render(<App />);
-</script></body></html>
+        {travel>0&&<div style={{fontSize:11,color:T.textMuted,marginTop:3,
