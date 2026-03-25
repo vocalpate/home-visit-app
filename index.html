@@ -287,6 +287,7 @@ function App() {
         </div>
         <div style={{ display:"flex", gap:8, alignItems:"center" }}>
           {alertCount>0 && <button onClick={()=>{setOnlyAlert(v=>!v);setView("list");}} style={{ background:onlyAlert?T.warning:"rgba(255,255,255,0.15)", border:`1.5px solid ${onlyAlert?T.warning:"rgba(255,255,255,0.3)"}`, color:"#fff", borderRadius:20, padding:"5px 12px", fontSize:12, fontWeight:700, cursor:"pointer" }}>⚠️ 即將結案 {alertCount}</button>}
+          <a href="route-planner.html" style={{ background:"rgba(255,255,255,0.15)", border:"1px solid rgba(255,255,255,0.25)", borderRadius:8, padding:"7px 10px", color:"#fff", cursor:"pointer", fontSize:14, textDecoration:"none" }} title="前往路線規劃">🗺️</a>
           <button onClick={()=>{setGasDraft(gasUrl);setShowSettings(v=>!v);}} style={{ background:"rgba(255,255,255,0.15)", border:"1px solid rgba(255,255,255,0.25)", borderRadius:8, padding:"7px 10px", color:"#fff", cursor:"pointer", fontSize:14 }}>⚙️</button>
         </div>
       </header>
