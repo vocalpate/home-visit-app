@@ -47,6 +47,7 @@ const LOCAL_KEY = "home_visit_v2";
 const loadLocal = () => { try { return JSON.parse(localStorage.getItem(LOCAL_KEY)||"[]"); } catch { return []; } };
 const saveLocal = d => localStorage.setItem(LOCAL_KEY, JSON.stringify(d));
 const GAS_KEY = "gas_url_v2";
+const SIGN_GAS_KEY = "sign_gas_url_v1";
 
 // Excel 欄位自動對應
 const FIELD_MAP = [
@@ -133,6 +134,8 @@ function App() {
   const [delTarget, setDelTarget] = useState(null);
   const [gasUrl, setGasUrl]       = useState(()=>localStorage.getItem(GAS_KEY)||"");
   const [gasDraft, setGasDraft]   = useState(()=>localStorage.getItem(GAS_KEY)||"");
+  const [signGasUrl, setSignGasUrl] = useState(()=>localStorage.getItem(SIGN_GAS_KEY)||"");
+  const [signGasDraft, setSignGasDraft] = useState(()=>localStorage.getItem(SIGN_GAS_KEY)||"");
   const [showSettings, setShowSettings] = useState(false);
   const [selectMode, setSelectMode]     = useState(false);
   const [selected, setSelected]         = useState(new Set());
@@ -303,6 +306,14 @@ function App() {
               style={{ background:T.primaryLight, border:"none", borderRadius:7, padding:"8px 16px", color:"#fff", cursor:"pointer", fontWeight:700, fontSize:13 }}>儲存</button>
           </div>
           {gasUrl?<div style={{ fontSize:11, marginTop:6, color:T.primaryLight }}>✅ 已設定同步網址</div>:<div style={{ fontSize:11, marginTop:6, opacity:.55 }}>未設定時資料僅存於瀏覽器本機</div>}
+          <div style={{ fontSize:12, opacity:.75, marginBottom:6, marginTop:14 }}>簽名系統網址（居家醫療線上簽名 GAS）</div>
+          <div style={{ display:"flex", gap:8 }}>
+            <input value={signGasDraft} onChange={e=>setSignGasDraft(e.target.value)} placeholder="https://script.google.com/macros/s/.../exec"
+              style={{ flex:1, padding:"8px 12px", borderRadius:7, border:"1px solid rgba(255,255,255,0.2)", background:"rgba(255,255,255,0.1)", color:"#fff", fontSize:13 }} />
+            <button onClick={()=>{localStorage.setItem(SIGN_GAS_KEY,signGasDraft);setSignGasUrl(signGasDraft);pushToast("✅ 簽名系統網址已儲存");setShowSettings(false);}}
+              style={{ background:T.primaryLight, border:"none", borderRadius:7, padding:"8px 16px", color:"#fff", cursor:"pointer", fontWeight:700, fontSize:13 }}>儲存</button>
+          </div>
+          {signGasUrl?<div style={{ fontSize:11, marginTop:6, color:T.primaryLight }}>✅ 已設定簽名系統</div>:<div style={{ fontSize:11, marginTop:6, opacity:.55 }}>設定後患者卡片將顯示複製簽名連結按鈕</div>}
         </div>
       )}
 
@@ -351,7 +362,9 @@ function App() {
             ):(
               filtered.map(p=>(
                 <PatientCard key={p.id} p={p} selectMode={selectMode} selected={selected.has(p.id)}
+                  signGasUrl={signGasUrl}
                   onToggle={()=>toggleSelect(p.id)}
+                  onCopied={()=>pushToast("📋 簽名連結已複製")}
                   onClick={()=>{ if(!selectMode){setEditing(p);setView("detail");}else toggleSelect(p.id); }} />
               ))
             )}
@@ -447,14 +460,34 @@ function App() {
 }
 
 // 個案卡片
-function PatientCard({ p, onClick, selectMode, selected, onToggle }) {
+function PatientCard({ p, onClick, selectMode, selected, onToggle, signGasUrl, onCopied }) {
   const days=daysUntil(p.closeDate);
   const manuallyClosed=!!p.closedAt;
   const expired=manuallyClosed||(days!==null&&days<0);
   const alert30=!expired&&days!==null&&days<=30&&days>=0;
   const [hover,setHover]=useState(false);
+  const [copying,setCopying]=useState(false);
   const bg=selected?"#EAF4EE":expired?"#EFEFEF":alert30?T.yellow:"#fff";
   const border=expired?"#CCCCCC":selected?"#2D6A4F":alert30?T.yellowBorder:hover?T.primaryLight:T.border;
+
+  const copySignLink = async e => {
+    e.stopPropagation();
+    if (!signGasUrl || copying) return;
+    setCopying(true);
+    try {
+      const res = await fetch(`${signGasUrl}?action=getSignUrl&name=${encodeURIComponent(p.name)}`);
+      const data = await res.json();
+      if (data.url) {
+        await navigator.clipboard.writeText(data.url);
+        onCopied && onCopied();
+      }
+    } catch(err) {
+      // clipboard fallback
+      alert("複製失敗，請確認簽名系統網址設定正確");
+    }
+    setCopying(false);
+  };
+
   return (
     <div onClick={onClick} onMouseEnter={()=>setHover(true)} onMouseLeave={()=>setHover(false)}
       style={{ background:bg, border:`1.5px solid ${border}`, borderRadius:12, padding:"13px 16px", marginBottom:9, cursor:"pointer", opacity:expired?0.7:1, boxShadow:hover?"0 4px 18px rgba(0,0,0,0.1)":alert30?"0 2px 12px rgba(255,179,0,.18)":"0 1px 6px rgba(0,0,0,0.05)", transform:hover?"translateY(-1px)":"none", transition:"all .18s ease", display:"flex", alignItems:"center", gap:10 }}>
@@ -475,9 +508,17 @@ function PatientCard({ p, onClick, selectMode, selected, onToggle }) {
               {p.diagnosis&&<span>🩺 {p.diagnosis}</span>}
             </div>
           </div>
-          <div style={{ textAlign:"right", fontSize:11, color:T.textMuted, flexShrink:0, marginLeft:10 }}>
-            <div>收案 {fmt(p.admitDate)}</div>
-            <div style={{ color:alert30?T.warning:T.textMuted, fontWeight:alert30?700:400, marginTop:2 }}>結案 {fmt(p.closeDate)}</div>
+          <div style={{ display:"flex", flexDirection:"column", alignItems:"flex-end", gap:6, flexShrink:0, marginLeft:10 }}>
+            <div style={{ textAlign:"right", fontSize:11, color:T.textMuted }}>
+              <div>收案 {fmt(p.admitDate)}</div>
+              <div style={{ color:alert30?T.warning:T.textMuted, fontWeight:alert30?700:400, marginTop:2 }}>結案 {fmt(p.closeDate)}</div>
+            </div>
+            {signGasUrl && !expired && (
+              <button onClick={copySignLink} disabled={copying}
+                style={{ background:copying?"#e5e7eb":"#eff4ff", color:copying?"#9ca3af":"#2563eb", border:"1px solid #bfdbfe", borderRadius:8, padding:"5px 10px", fontSize:12, fontWeight:600, cursor:copying?"not-allowed":"pointer", whiteSpace:"nowrap" }}>
+                {copying ? "取得中…" : "📋 簽名連結"}
+              </button>
+            )}
           </div>
         </div>
       </div>
